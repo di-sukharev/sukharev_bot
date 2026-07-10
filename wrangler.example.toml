@@ -1,0 +1,29 @@
+name = "sukharev-community-bot"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[vars]
+ALLOWED_CHAT_IDS = "-1001234567890"
+OWNER_USER_IDS = "123456789"
+ANNOUNCE_REACTIONS = "false"
+WELCOME_MUTED_UNTIL = ""
+LINK_ALLOWED_USERNAMES = "example_admin"
+BOT_INFO = "{\"id\":0,\"is_bot\":true,\"first_name\":\"Community Bot\",\"username\":\"replace_me_bot\",\"can_join_groups\":true,\"can_read_all_group_messages\":true,\"supports_inline_queries\":false}"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sukharev-community-bot"
+database_id = "replace-with-cloudflare-d1-database-id"
+migrations_dir = "drizzle/migrations"
+
+[[queues.producers]]
+binding = "VIBE_NOTIFICATION_DELETE_QUEUE"
+queue = "sukharev-community-bot-vibe-notification-deletes"
+
+[[queues.consumers]]
+queue = "sukharev-community-bot-vibe-notification-deletes"
+max_batch_size = 10
+max_batch_timeout = 1
+max_retries = 3

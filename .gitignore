@@ -1,0 +1,31 @@
+node_modules/
+dist/
+coverage/
+.wrangler/
+
+# Local and production configuration
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+wrangler.toml
+wrangler.*.toml
+!wrangler.example.toml
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Logs and operating-system files
+*.log
+.DS_Store
+
+# Local editor and agent state
+.idea/
+.vscode/
+.zed/
+.agent/
+.agents/
+.claude/
+.codex/

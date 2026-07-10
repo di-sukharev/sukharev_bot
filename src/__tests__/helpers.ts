@@ -1,0 +1,327 @@
+import type {
+  CommunityBotRepository,
+  ModerationActionInput,
+  ReactionVibeState,
+  ReactionVibeStateInput,
+  StoredTelegramMessage,
+  TelegramChatProfile,
+  TelegramUserProfile,
+  VibeLedgerInput,
+  VibeTopEntry,
+} from "../types";
+
+export function createTestEnv(
+  allowedChatIds = "-1001",
+  overrides: Partial<{
+    OWNER_USER_IDS: string;
+    ANNOUNCE_REACTIONS: string;
+    WELCOME_MUTED_UNTIL: string;
+    LINK_ALLOWED_USERNAMES: string;
+    VIBE_NOTIFICATION_DELETE_QUEUE: Queue<unknown>;
+  }> = {},
+) {
+  return {
+    DB: {} as D1Database,
+    BOT_TOKEN: "123:test",
+    TELEGRAM_WEBHOOK_SECRET: "secret",
+    ALLOWED_CHAT_IDS: allowedChatIds,
+    OWNER_USER_IDS: "",
+    ANNOUNCE_REACTIONS: "false",
+    LINK_ALLOWED_USERNAMES: "",
+    BOT_INFO: JSON.stringify({
+      id: 123,
+      is_bot: true,
+      first_name: "Community Bot",
+      username: "CommunityBot",
+      can_join_groups: true,
+      can_read_all_group_messages: true,
+      supports_inline_queries: false,
+    }),
+    ...overrides,
+  };
+}
+
+export type QueuedMessage<Body> = {
+  message: Body;
+  options?: QueueSendOptions;
+};
+
+export function createQueueMock<Body>() {
+  const messages: Array<QueuedMessage<Body>> = [];
+  const queue: Queue<Body> = {
+    async metrics() {
+      return {
+        backlogCount: messages.length,
+        backlogBytes: 0,
+      };
+    },
+    async send(message, options) {
+      messages.push({ message, options });
+      return {
+        metadata: {
+          metrics: {
+            backlogCount: messages.length,
+            backlogBytes: 0,
+          },
+        },
+      };
+    },
+    async sendBatch(batch, options) {
+      for (const request of batch) {
+        messages.push({
+          message: request.body,
+          options: {
+            contentType: request.contentType,
+            delaySeconds: request.delaySeconds ?? options?.delaySeconds,
+          },
+        });
+      }
+
+      return {
+        metadata: {
+          metrics: {
+            backlogCount: messages.length,
+            backlogBytes: 0,
+          },
+        },
+      };
+    },
+  };
+
+  return { messages, queue };
+}
+
+export function installTelegramFetchMock() {
+  const requests: Array<{ url: string; body: unknown }> = [];
+
+  return {
+    requests,
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = parseRequestBody(init?.body);
+      requests.push({ url: String(input), body });
+
+      return Response.json({
+        ok: true,
+        result: {
+          message_id: requests.length,
+          date: 1,
+          chat: { id: -1001, type: "supergroup", title: "Students" },
+        },
+      });
+    }) as typeof fetch,
+    restore() {
+      requests.length = 0;
+    },
+  };
+}
+
+function parseRequestBody(body: BodyInit | null | undefined): unknown {
+  if (typeof body !== "string") {
+    return body ?? null;
+  }
+
+  try {
+    return JSON.parse(body);
+  } catch {
+    return body;
+  }
+}
+
+export class InMemoryCommunityBotRepository implements CommunityBotRepository {
+  readonly users = new Map<string, TelegramUserProfile>();
+  readonly chats = new Map<string, TelegramChatProfile>();
+  readonly messages = new Map<string, StoredTelegramMessage>();
+  readonly ledger = new Map<string, VibeLedgerInput>();
+  readonly processedUpdates = new Set<number>();
+  readonly processingUpdates = new Map<number, string>();
+  readonly reactionStates = new Map<string, ReactionVibeStateInput>();
+  readonly reactionAwardReservations = new Map<string, string>();
+  readonly moderationActions = new Map<string, ModerationActionInput>();
+
+  async reserveUpdateProcessing(updateId: number) {
+    if (this.processedUpdates.has(updateId)) {
+      return { status: "processed" as const };
+    }
+    if (this.processingUpdates.has(updateId)) {
+      return { status: "processing" as const };
+    }
+
+    const token = `reservation-${updateId}-${this.processingUpdates.size}`;
+    this.processingUpdates.set(updateId, token);
+    return { status: "reserved" as const, updateId, token };
+  }
+
+  async markUpdateProcessed(reservation: {
+    updateId: number;
+    token: string;
+  }): Promise<boolean> {
+    if (
+      this.processedUpdates.has(reservation.updateId) ||
+      this.processingUpdates.get(reservation.updateId) !== reservation.token
+    ) {
+      return false;
+    }
+
+    this.processingUpdates.delete(reservation.updateId);
+    this.processedUpdates.add(reservation.updateId);
+    return true;
+  }
+
+  async releaseUpdateReservation(reservation: {
+    updateId: number;
+    token: string;
+  }): Promise<void> {
+    if (this.processingUpdates.get(reservation.updateId) === reservation.token) {
+      this.processingUpdates.delete(reservation.updateId);
+    }
+  }
+
+  async upsertUser(user: TelegramUserProfile): Promise<void> {
+    this.users.set(user.id, user);
+  }
+
+  async upsertChat(chat: TelegramChatProfile): Promise<void> {
+    this.chats.set(chat.id, chat);
+  }
+
+  async storeMessage(message: StoredTelegramMessage): Promise<void> {
+    this.messages.set(messageKey(message.chatId, message.messageId), message);
+  }
+
+  async findMessageAuthor(
+    chatId: string,
+    messageId: number,
+  ): Promise<TelegramUserProfile | null> {
+    const message = this.messages.get(messageKey(chatId, messageId));
+    if (!message) {
+      return null;
+    }
+
+    return this.users.get(message.authorUserId) ?? null;
+  }
+
+  async addVibeLedgerEntry(input: VibeLedgerInput): Promise<boolean> {
+    if (this.ledger.has(input.idempotencyKey)) {
+      return false;
+    }
+
+    this.ledger.set(input.idempotencyKey, input);
+    return true;
+  }
+
+  async getReactionVibeState(
+    chatId: string,
+    messageId: number,
+    actorId: string,
+  ): Promise<ReactionVibeState> {
+    const state = this.reactionStates.get(reactionAwardKey(chatId, messageId, actorId));
+    return {
+      positiveReactionCount: state?.positiveReactionCount ?? 0,
+      negativeReactionCount: state?.negativeReactionCount ?? 0,
+    };
+  }
+
+  async reserveReactionProcessing(
+    chatId: string,
+    messageId: number,
+    actorId: string,
+  ): Promise<{
+    chatId: string;
+    messageId: number;
+    actorId: string;
+    token: string;
+  } | null> {
+    const key = reactionAwardKey(chatId, messageId, actorId);
+    if (this.reactionAwardReservations.has(key)) {
+      return null;
+    }
+
+    const token = `reaction-reservation-${this.reactionAwardReservations.size}`;
+    this.reactionAwardReservations.set(key, token);
+    return { chatId, messageId, actorId, token };
+  }
+
+  async releaseReactionProcessing(reservation: {
+    chatId: string;
+    messageId: number;
+    actorId: string;
+    token: string;
+  }): Promise<void> {
+    const key = reactionAwardKey(
+      reservation.chatId,
+      reservation.messageId,
+      reservation.actorId,
+    );
+    if (this.reactionAwardReservations.get(key) === reservation.token) {
+      this.reactionAwardReservations.delete(key);
+    }
+  }
+
+  async setReactionVibeState(input: ReactionVibeStateInput): Promise<void> {
+    const key = reactionAwardKey(input.chatId, input.messageId, input.actorId);
+    if (input.positiveReactionCount <= 0 && input.negativeReactionCount <= 0) {
+      this.reactionStates.delete(key);
+      return;
+    }
+
+    this.reactionStates.set(key, input);
+  }
+
+  async getMessageNegativeReactionCount(chatId: string, messageId: number): Promise<number> {
+    return [...this.reactionStates.values()]
+      .filter((state) => state.chatId === chatId && state.messageId === messageId)
+      .reduce((sum, state) => sum + state.negativeReactionCount, 0);
+  }
+
+  async addModerationAction(input: ModerationActionInput): Promise<boolean> {
+    if (this.moderationActions.has(input.idempotencyKey)) {
+      return false;
+    }
+
+    this.moderationActions.set(input.idempotencyKey, input);
+    return true;
+  }
+
+  async getVibeScore(chatId: string, userId: string): Promise<number> {
+    return [...this.ledger.values()]
+      .filter((entry) => entry.chatId === chatId && entry.recipientUserId === userId)
+      .reduce((sum, entry) => sum + entry.delta, 0);
+  }
+
+  async getVibeTop(chatId: string, limit: number): Promise<VibeTopEntry[]> {
+    const scores = new Map<string, number>();
+    for (const entry of this.ledger.values()) {
+      if (entry.chatId !== chatId) {
+        continue;
+      }
+
+      scores.set(entry.recipientUserId, (scores.get(entry.recipientUserId) ?? 0) + entry.delta);
+    }
+
+    return [...scores.entries()]
+      .filter(([, score]) => score > 0)
+      .sort(([, leftScore], [, rightScore]) => rightScore - leftScore)
+      .slice(0, limit)
+      .map(([userId, score]) => {
+        const user = this.users.get(userId);
+        return {
+          userId,
+          displayName: user?.displayName ?? userId,
+          username: user?.username ?? null,
+          score,
+        };
+      });
+  }
+}
+
+function messageKey(chatId: string, messageId: number): string {
+  return `${chatId}:${messageId}`;
+}
+
+function reactionAwardKey(
+  chatId: string,
+  messageId: number,
+  actorId: string,
+): string {
+  return `${chatId}:${messageId}:${actorId}`;
+}

@@ -1,0 +1,8 @@
+BOT_TOKEN="replace-with-botfather-token"
+TELEGRAM_WEBHOOK_SECRET="replace-with-random-secret"
+TELEGRAM_WEBHOOK_URL="https://example.workers.dev/telegram/webhook"
+TELEGRAM_WEBHOOK_ALLOWED_HOST="example.workers.dev"
+ALLOWED_CHAT_IDS="-1001234567890"
+OWNER_USER_IDS="123456789"
+ANNOUNCE_REACTIONS="false"
+LINK_ALLOWED_USERNAMES="example_admin"

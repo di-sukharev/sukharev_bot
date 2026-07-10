@@ -1,0 +1,33 @@
+{
+  "name": "sukharev-bot",
+  "version": "1.0.0",
+  "description": "Telegram community moderation and vibe bot for Cloudflare Workers",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "packageManager": "bun@1.3.11",
+  "overrides": {
+    "fast-uri": "3.1.2"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "bun run production:preflight && wrangler deploy",
+    "check": "tsc --noEmit",
+    "test": "bun test",
+    "release:guard": "bun run src/scripts/validate-clean-git.ts",
+    "production:preflight": "bun run release:guard && bun run src/scripts/validate-production-vars.ts",
+    "d1:migrate:local": "wrangler d1 migrations apply DB --local",
+    "d1:migrate:prod": "bun run release:guard && wrangler d1 migrations apply DB --remote",
+    "webhook:set": "bun run src/scripts/set-webhook.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.2",
+    "grammy": "1.43.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260527.1",
+    "@types/bun": "1.3.14",
+    "typescript": "6.0.3",
+    "wrangler": "4.95.0"
+  }
+}
