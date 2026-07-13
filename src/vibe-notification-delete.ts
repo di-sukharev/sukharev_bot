@@ -1,4 +1,5 @@
 export const VIBE_NOTIFICATION_DELETE_DELAY_SECONDS = 5;
+export const WELCOME_MESSAGE_DELETE_DELAY_SECONDS = 15;
 
 export type VibeNotificationDeleteJob = {
   chatId: number | string;
@@ -17,6 +18,7 @@ type TelegramDeleteMessageEnv = {
 export type VibeNotificationDeleteOptions = {
   apiFetch?: typeof fetch;
   delayMs?: number;
+  delaySeconds?: number;
   scheduleTask?: (task: Promise<void>) => void;
 };
 
@@ -25,13 +27,16 @@ export async function scheduleVibeNotificationDelete(
   job: VibeNotificationDeleteJob,
   options: VibeNotificationDeleteOptions = {},
 ): Promise<void> {
+  const delaySeconds =
+    options.delaySeconds ?? VIBE_NOTIFICATION_DELETE_DELAY_SECONDS;
+
   if (options.scheduleTask) {
     options.scheduleTask(
       deleteTelegramMessageAfterDelay(
         env,
         job,
         options.apiFetch ?? fetch,
-        options.delayMs ?? VIBE_NOTIFICATION_DELETE_DELAY_SECONDS * 1000,
+        options.delayMs ?? delaySeconds * 1000,
       ).catch((error) => {
         console.error("Failed to delete delayed vibe notification", {
           chatId: job.chatId,
@@ -49,7 +54,7 @@ export async function scheduleVibeNotificationDelete(
 
   try {
     await env.VIBE_NOTIFICATION_DELETE_QUEUE.send(job, {
-      delaySeconds: VIBE_NOTIFICATION_DELETE_DELAY_SECONDS,
+      delaySeconds,
     });
   } catch (error) {
     console.error("Failed to queue vibe notification delete", {

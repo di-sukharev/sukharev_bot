@@ -37,6 +37,7 @@ import {
 import {
   scheduleVibeNotificationDelete,
   type VibeNotificationDeleteOptions,
+  WELCOME_MESSAGE_DELETE_DELAY_SECONDS,
 } from "./vibe-notification-delete";
 
 export type CommunityBotContext = Context & {
@@ -81,6 +82,7 @@ export function createCommunityBot(
   const notificationDelete: VibeNotificationDeleteOptions = {
     apiFetch: options.notificationDelete?.apiFetch ?? options.apiFetch,
     delayMs: options.notificationDelete?.delayMs,
+    delaySeconds: options.notificationDelete?.delaySeconds,
     scheduleTask: options.notificationDelete?.scheduleTask,
   };
 
@@ -210,9 +212,24 @@ export function createCommunityBot(
     }
 
     const welcome = buildWelcomeMessage(profile.displayName);
-    await ctx.api.sendMessage(chatMemberUpdate.chat.id, welcome.text, {
-      parse_mode: welcome.parseMode,
-    });
+    const sentMessage = await ctx.api.sendMessage(
+      chatMemberUpdate.chat.id,
+      welcome.text,
+      {
+        parse_mode: welcome.parseMode,
+      },
+    );
+    await scheduleVibeNotificationDelete(
+      env,
+      {
+        chatId: chatMemberUpdate.chat.id,
+        messageId: sentMessage.message_id,
+      },
+      {
+        ...ctx.notificationDelete,
+        delaySeconds: WELCOME_MESSAGE_DELETE_DELAY_SECONDS,
+      },
+    );
   });
 
   bot.on("message_reaction", async (ctx) => {

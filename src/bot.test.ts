@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import type { ReactionTypeEmoji, Update } from "grammy/types";
 import { createCommunityBot } from "./bot";
 import {
@@ -60,6 +60,63 @@ describe("community bot", () => {
 
     expect(fetchMock.requests).toHaveLength(0);
     expect(repository.users.has("10")).toBe(true);
+  });
+
+  test("queues welcome messages for deletion after fifteen seconds", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const queueMock = createQueueMock<VibeNotificationDeleteJob>();
+    const bot = createCommunityBot(
+      createTestEnv("-1001", {
+        VIBE_NOTIFICATION_DELETE_QUEUE: queueMock.queue,
+      }),
+      {
+        repository,
+        apiFetch: fetchMock.fetch,
+      },
+    );
+
+    await bot.handleUpdate(chatMemberUpdate());
+
+    expect(queueMock.messages).toEqual([
+      {
+        message: { chatId: -1001, messageId: 1 },
+        options: { delaySeconds: 15 },
+      },
+    ]);
+  });
+
+  test("deletes welcome messages after fifteen seconds in a background task", async () => {
+    jest.useFakeTimers();
+    const repository = new InMemoryCommunityBotRepository();
+    const scheduledTasks: Array<Promise<void>> = [];
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+      notificationDelete: {
+        apiFetch: fetchMock.fetch,
+        scheduleTask: (task) => scheduledTasks.push(task),
+      },
+    });
+
+    try {
+      await bot.handleUpdate(chatMemberUpdate());
+
+      expect(scheduledTasks).toHaveLength(1);
+      expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+
+      jest.advanceTimersByTime(14_999);
+      await Promise.resolve();
+      expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+
+      jest.advanceTimersByTime(1);
+      await Promise.all(scheduledTasks);
+      expect(telegramMethodRequests("deleteMessage")[0]?.body).toMatchObject({
+        chat_id: -1001,
+        message_id: 1,
+      });
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test("shows current rules with /rules", async () => {
