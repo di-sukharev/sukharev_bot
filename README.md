@@ -121,9 +121,10 @@ After deployment, use `/chatid` to discover the target chat ID. Add it to
 bun run webhook:set
 ```
 
-The setup script registers `message`, `edited_message`, `chat_member`,
-`message_reaction`, and `message_reaction_count` updates with one Telegram
-connection. It refuses to mutate the webhook from a dirty Git tree.
+The setup script registers `message`, `edited_message`, `channel_post`,
+`edited_channel_post`, `chat_member`, `message_reaction`, and
+`message_reaction_count` updates with one Telegram connection. It refuses to
+mutate the webhook from a dirty Git tree.
 
 ## Development and release
 

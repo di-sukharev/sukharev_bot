@@ -169,6 +169,47 @@ describe("community bot", () => {
     });
   });
 
+  test("retries a failed moderation warning without deleting twice", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    let deleteAttempts = 0;
+    let warningAttempts = 0;
+    const apiFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/deleteMessage")) {
+        deleteAttempts += 1;
+      }
+      if (url.endsWith("/sendMessage")) {
+        warningAttempts += 1;
+        if (warningAttempts === 1) {
+          return Response.json({
+            ok: false,
+            error_code: 500,
+            description: "temporary warning failure",
+          });
+        }
+      }
+
+      return fetchMock.fetch(input, init);
+    }) as typeof fetch;
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch });
+    const update = linkMessageUpdate({
+      updateId: 80,
+      text: "скам https://example.com/claim",
+      links: ["https://example.com/claim"],
+    });
+
+    await expect(bot.handleUpdate(update)).rejects.toThrow(
+      "temporary warning failure",
+    );
+    expect(repository.processedUpdates.has(update.update_id)).toBe(false);
+
+    await bot.handleUpdate(update);
+
+    expect(deleteAttempts).toBe(1);
+    expect(warningAttempts).toBe(2);
+    expect(repository.processedUpdates.has(update.update_id)).toBe(true);
+  });
+
   test("keeps Telegram-autolinked Cyrillic dotted text", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const bot = createCommunityBot(createTestEnv(), {
@@ -328,7 +369,7 @@ describe("community bot", () => {
       }),
     );
 
-    expect(repository.messages.size).toBe(0);
+    expect(repository.messages.size).toBe(1);
     expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
     expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
   });
@@ -352,6 +393,60 @@ describe("community bot", () => {
     expect(telegramMethodRequests("sendMessage").at(-1)?.body).toMatchObject({
       text: expect.stringContaining(LINK_MODERATION_MESSAGE),
     });
+  });
+
+  test("deletes forbidden links from bot inline keyboard buttons", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      botMessageUpdate({
+        text: "получить подарок",
+        buttonUrl: "https://example.com/claim",
+      }),
+    );
+
+    expect(repository.messages.size).toBe(0);
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
+    expect(telegramMethodRequests("deleteMessage")[0]?.body).toMatchObject({
+      chat_id: -1001,
+      message_id: 300,
+    });
+  });
+
+  test("moderates new and edited channel posts", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      channelPostUpdate({
+        updateId: 30,
+        messageId: 330,
+        text: "акция https://example.com/claim",
+        link: "https://example.com/claim",
+      }),
+    );
+    await bot.handleUpdate(
+      channelPostUpdate({
+        edited: true,
+        updateId: 31,
+        messageId: 331,
+        text: "новая акция https://example.org/claim",
+        link: "https://example.org/claim",
+      }),
+    );
+
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(2);
+    expect(telegramMethodRequests("deleteMessage").map((request) => request.body)).toEqual([
+      expect.objectContaining({ message_id: 330 }),
+      expect.objectContaining({ message_id: 331 }),
+    ]);
   });
 
   test("deletes a hidden text_link even when the visible text has no URL", async () => {
@@ -493,9 +588,24 @@ describe("community bot", () => {
 
     await bot.handleUpdate(linkedChannelAutomaticForwardUpdate());
 
-    expect(repository.messages.size).toBe(0);
+    expect(repository.messages.size).toBe(1);
     expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
     expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
+  });
+
+  test("deletes forbidden buttons from automatic discussion forwards", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      linkedChannelAutomaticForwardUpdate("https://example.com/claim"),
+    );
+
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
+    expect(repository.messages.size).toBe(0);
   });
 
   test("deletes a message with a deceptive GitHub-looking host", async () => {
@@ -785,7 +895,7 @@ describe("community bot", () => {
     expect(telegramMethodRequests("banChatMember")).toHaveLength(0);
   });
 
-  test("deletes a message after three active negative reactions", async () => {
+  test("deletes a message after five active negative reactions", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const bot = createCommunityBot(
       createTestEnv("-1001", { ANNOUNCE_REACTIONS: "true" }),
@@ -801,12 +911,374 @@ describe("community bot", () => {
     await bot.handleUpdate(reactionUpdate(5, [], [emojiReaction("👎")], { actorId: 22 }));
     await bot.handleUpdate(reactionUpdate(6, [], [emojiReaction("💩")], { actorId: 23 }));
 
-    expect(await repository.getVibeScore("-1001", "10")).toBe(-4);
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+
+    await bot.handleUpdate(reactionUpdate(7, [], [emojiReaction("👎")], { actorId: 24 }));
+
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-5);
     expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
     expect(telegramMethodRequests("deleteMessage")[0]?.body).toMatchObject({
       chat_id: -1001,
       message_id: 100,
     });
+  });
+
+  test("retries a threshold deletion after a transient Telegram failure", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    let deleteAttempts = 0;
+    const apiFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/deleteMessage")) {
+        deleteAttempts += 1;
+        if (deleteAttempts === 1) {
+          return Response.json({
+            ok: false,
+            error_code: 500,
+            description: "temporary Telegram failure",
+          });
+        }
+      }
+
+      return fetchMock.fetch(input, init);
+    }) as typeof fetch;
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch });
+
+    await bot.handleUpdate(questionMessageUpdate());
+    for (let index = 0; index < 4; index += 1) {
+      await bot.handleUpdate(
+        reactionUpdate(3 + index, [], [emojiReaction("👎")], {
+          actorId: 20 + index,
+        }),
+      );
+    }
+
+    const thresholdUpdate = reactionUpdate(7, [], [emojiReaction("👎")], {
+      actorId: 24,
+    });
+    await expect(bot.handleUpdate(thresholdUpdate)).rejects.toThrow(
+      "temporary Telegram failure",
+    );
+    expect(repository.processedUpdates.has(thresholdUpdate.update_id)).toBe(false);
+    expect(repository.moderationActions.size).toBe(0);
+
+    await bot.handleUpdate(thresholdUpdate);
+
+    expect(deleteAttempts).toBe(2);
+    expect(repository.processedUpdates.has(thresholdUpdate.update_id)).toBe(true);
+    expect(repository.moderationActions.size).toBe(1);
+  });
+
+  test("completes deletion when Telegram says the message is already gone", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    let deleteAttempts = 0;
+    const apiFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/deleteMessage")) {
+        deleteAttempts += 1;
+        return Response.json({
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: message to delete not found",
+        });
+      }
+
+      return fetchMock.fetch(input, init);
+    }) as typeof fetch;
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch });
+
+    await bot.handleUpdate(questionMessageUpdate());
+    for (let index = 0; index < 5; index += 1) {
+      await bot.handleUpdate(
+        reactionUpdate(3 + index, [], [emojiReaction("👎")], {
+          actorId: 20 + index,
+        }),
+      );
+    }
+
+    expect(deleteAttempts).toBe(1);
+    expect(repository.processedUpdates.has(7)).toBe(true);
+    expect(repository.moderationActions.has("delete_message:-1001:100")).toBe(true);
+  });
+
+  test("deletes an unknown-author message after five negative reactions", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    for (let index = 0; index < 4; index += 1) {
+      await bot.handleUpdate(
+        reactionUpdate(30 + index, [], [emojiReaction("👎")], {
+          actorId: 20 + index,
+          messageId: 999,
+        }),
+      );
+    }
+
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+
+    await bot.handleUpdate(
+      reactionUpdate(34, [], [emojiReaction("💩")], {
+        actorId: 24,
+        messageId: 999,
+      }),
+    );
+
+    expect(repository.ledger.size).toBe(0);
+    expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
+    expect(telegramMethodRequests("deleteMessage")[0]?.body).toMatchObject({
+      chat_id: -1001,
+      message_id: 999,
+    });
+    expect(repository.moderationActions.values().next().value).toMatchObject({
+      targetUserId: null,
+      targetMessageId: 999,
+    });
+  });
+
+  test("deletes an unknown-author message from aggregate reaction counts", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      reactionCountUpdate(
+        40,
+        [{ type: { type: "emoji", emoji: "👎" }, total_count: 4 }],
+        { messageId: 998 },
+      ),
+    );
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+
+    await bot.handleUpdate(
+      reactionCountUpdate(
+        41,
+        [{ type: { type: "emoji", emoji: "👎" }, total_count: 5 }],
+        { messageId: 998 },
+      ),
+    );
+
+    expect(repository.ledger.size).toBe(0);
+    expect(telegramMethodRequests("deleteMessage")[0]?.body).toMatchObject({
+      chat_id: -1001,
+      message_id: 998,
+    });
+  });
+
+  test("ignores a stale per-user reaction snapshot delivered out of order", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(questionMessageUpdate());
+    await bot.handleUpdate(
+      reactionUpdate(101, [emojiReaction("👎")], [], { actorId: 20 }),
+    );
+    await bot.handleUpdate(
+      reactionUpdate(100, [], [emojiReaction("👎")], { actorId: 20 }),
+    );
+
+    const state = await repository.getReactionVibeState("-1001", 100, "20");
+    expect(state).toMatchObject({
+      negativeReactionCount: 0,
+      lastUpdateId: 101,
+    });
+    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+  });
+
+  test("accepts a newer reaction date after Telegram resets update ids", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(questionMessageUpdate());
+    await bot.handleUpdate(
+      reactionUpdate(900, [], [emojiReaction("👎")], {
+        actorId: 20,
+        date: 100,
+      }),
+    );
+    await bot.handleUpdate(
+      reactionUpdate(100, [emojiReaction("👎")], [], {
+        actorId: 20,
+        date: 200,
+      }),
+    );
+
+    const state = await repository.getReactionVibeState("-1001", 100, "20");
+    expect(state).toMatchObject({
+      negativeReactionCount: 0,
+      lastUpdateDate: 200,
+      lastUpdateId: 100,
+    });
+    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+  });
+
+  test("does not restore a stale five-reaction aggregate snapshot", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(questionMessageUpdate());
+    await bot.handleUpdate(
+      reactionCountUpdate(101, [
+        { type: { type: "emoji", emoji: "👎" }, total_count: 4 },
+      ]),
+    );
+    await bot.handleUpdate(
+      reactionCountUpdate(100, [
+        { type: { type: "emoji", emoji: "👎" }, total_count: 5 },
+      ]),
+    );
+
+    const state = await repository.getReactionVibeState(
+      "-1001",
+      100,
+      "__reaction_count__",
+    );
+    expect(state).toMatchObject({
+      negativeReactionCount: 4,
+      lastUpdateId: 101,
+    });
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+  });
+
+  test("does not grant vibe when an unknown-author negative reaction is removed", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      reactionUpdate(50, [], [emojiReaction("👎")], {
+        actorId: 20,
+        messageId: 997,
+      }),
+    );
+    await bot.handleUpdate(
+      editedQuestionMessageUpdate({
+        updateId: 51,
+        messageId: 997,
+        author: user(10, "Кирилл"),
+      }),
+    );
+    await bot.handleUpdate(
+      reactionUpdate(52, [emojiReaction("👎")], [], {
+        actorId: 20,
+        messageId: 997,
+      }),
+    );
+
+    expect(repository.ledger.size).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+  });
+
+  test("does not grant aggregate vibe after an unknown author becomes known", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      reactionCountUpdate(
+        60,
+        [{ type: { type: "emoji", emoji: "👎" }, total_count: 1 }],
+        { messageId: 996 },
+      ),
+    );
+    await bot.handleUpdate(
+      editedQuestionMessageUpdate({
+        updateId: 61,
+        messageId: 996,
+        author: user(10, "Кирилл"),
+      }),
+    );
+    await bot.handleUpdate(reactionCountUpdate(62, [], { messageId: 996 }));
+
+    expect(repository.ledger.size).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+  });
+
+  test("does not count an unknown-author self-reaction after attribution", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      reactionUpdate(70, [], [emojiReaction("👎")], {
+        actorId: 10,
+        messageId: 995,
+      }),
+    );
+    await bot.handleUpdate(
+      editedQuestionMessageUpdate({
+        updateId: 71,
+        messageId: 995,
+        author: user(10, "Кирилл"),
+      }),
+    );
+    for (let index = 0; index < 4; index += 1) {
+      await bot.handleUpdate(
+        reactionUpdate(72 + index, [], [emojiReaction("👎")], {
+          actorId: 20 + index,
+          messageId: 995,
+        }),
+      );
+    }
+
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+    expect(
+      await repository.getMessageNegativeReactionCount("-1001", 995, "10"),
+    ).toBe(4);
+
+    await bot.handleUpdate(
+      reactionUpdate(76, [emojiReaction("👎")], [], {
+        actorId: 10,
+        messageId: 995,
+      }),
+    );
+    expect(
+      (await repository.getReactionVibeState("-1001", 995, "10"))
+        .negativeReactionCount,
+    ).toBe(0);
+  });
+
+  test("deletes a bot-authored message after five negative reactions without vibe", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(botMessageUpdate());
+    for (let index = 0; index < 5; index += 1) {
+      await bot.handleUpdate(
+        reactionUpdate(2 + index, [], [emojiReaction("👎")], {
+          actorId: 20 + index,
+          messageId: 300,
+        }),
+      );
+    }
+
+    expect(repository.messages.size).toBe(1);
+    expect(repository.ledger.size).toBe(0);
+    expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
+    expect(telegramMethodRequests("deleteMessage")[0]?.body).toMatchObject({
+      chat_id: -1001,
+      message_id: 300,
+    });
+    expect(telegramMethodRequests("banChatMember")).toHaveLength(0);
   });
 
   test("does not ban an author after six active negative reactions above low-vibe threshold", async () => {
@@ -855,11 +1327,15 @@ describe("community bot", () => {
     );
 
     await bot.handleUpdate(questionMessageUpdate());
-    await bot.handleUpdate(reactionUpdate(3, [], [emojiReaction("💩")], { actorId: 20 }));
-    await bot.handleUpdate(reactionUpdate(4, [], [emojiReaction("💩")], { actorId: 21 }));
-    await bot.handleUpdate(reactionUpdate(5, [], [emojiReaction("💩")], { actorId: 22 }));
+    for (let index = 0; index < 5; index += 1) {
+      await bot.handleUpdate(
+        reactionUpdate(3 + index, [], [emojiReaction("💩")], {
+          actorId: 20 + index,
+        }),
+      );
+    }
 
-    expect(await repository.getVibeScore("-1001", "10")).toBe(-3);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-5);
     expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
     expect(telegramMethodRequests("banChatMember")).toHaveLength(0);
   });
@@ -883,7 +1359,7 @@ describe("community bot", () => {
     expect(telegramMethodRequests("banChatMember")).toHaveLength(0);
   });
 
-  test("ignores profanity and negative reactions for channel-authored messages", async () => {
+  test("deletes channel-authored messages after five reactions without vibe", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const bot = createCommunityBot(
       createTestEnv("-1001", { ANNOUNCE_REACTIONS: "true" }),
@@ -895,13 +1371,18 @@ describe("community bot", () => {
     );
 
     await bot.handleUpdate(senderChatMessageUpdate({ text: "badword" }));
-    await bot.handleUpdate(
-      reactionUpdate(3, [], [emojiReaction("👎")], { messageId: 200 }),
-    );
+    for (let index = 0; index < 5; index += 1) {
+      await bot.handleUpdate(
+        reactionUpdate(3 + index, [], [emojiReaction("👎")], {
+          actorId: 20 + index,
+          messageId: 200,
+        }),
+      );
+    }
 
     expect(repository.ledger.size).toBe(0);
     expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
-    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
     expect(telegramMethodRequests("banChatMember")).toHaveLength(0);
   });
 
@@ -1100,6 +1581,56 @@ describe("community bot", () => {
       chat_id: -1001,
       user_id: 10,
     });
+  });
+
+  test("retries a transient low-vibe ban failure", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    let banAttempts = 0;
+    const apiFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/banChatMember")) {
+        banAttempts += 1;
+        if (banAttempts === 1) {
+          return Response.json({
+            ok: false,
+            error_code: 500,
+            description: "temporary ban failure",
+          });
+        }
+      }
+
+      return fetchMock.fetch(input, init);
+    }) as typeof fetch;
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch,
+      profanityWords: ["badword"],
+    });
+
+    for (let index = 0; index < 9; index += 1) {
+      await bot.handleUpdate(
+        questionMessageUpdate({
+          updateId: index + 1,
+          messageId: 100 + index,
+          text: `badword ${index}`,
+        }),
+      );
+    }
+
+    const thresholdUpdate = questionMessageUpdate({
+      updateId: 10,
+      messageId: 109,
+      text: "badword 9",
+    });
+    await expect(bot.handleUpdate(thresholdUpdate)).rejects.toThrow(
+      "temporary ban failure",
+    );
+    expect(repository.processedUpdates.has(thresholdUpdate.update_id)).toBe(false);
+
+    await bot.handleUpdate(thresholdUpdate);
+
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-10);
+    expect(banAttempts).toBe(2);
+    expect(repository.processedUpdates.has(thresholdUpdate.update_id)).toBe(true);
   });
 
   test("does not ban protected users for profanity", async () => {
@@ -1350,6 +1881,24 @@ function questionMessageUpdate(
   } as Update;
 }
 
+function editedQuestionMessageUpdate(options: {
+  updateId: number;
+  messageId: number;
+  author: ReturnType<typeof user>;
+}): Update {
+  return {
+    update_id: options.updateId,
+    edited_message: {
+      message_id: options.messageId,
+      date: 1,
+      edit_date: options.updateId,
+      chat: chat(),
+      from: options.author,
+      text: "отредактированный пост",
+    },
+  } as Update;
+}
+
 function senderChatMessageUpdate(options: { text?: string } = {}): Update {
   return {
     update_id: 2,
@@ -1361,6 +1910,68 @@ function senderChatMessageUpdate(options: { text?: string } = {}): Update {
       text: options.text ?? "пост канала",
     },
   } as Update;
+}
+
+function botMessageUpdate(
+  options: {
+    updateId?: number;
+    messageId?: number;
+    text?: string;
+    buttonUrl?: string;
+  } = {},
+): Update {
+  return {
+    update_id: options.updateId ?? 1,
+    message: {
+      message_id: options.messageId ?? 300,
+      date: 1,
+      chat: chat(),
+      from: {
+        id: 9001,
+        is_bot: true,
+        first_name: "Promo",
+        username: "promo_bot",
+      },
+      text: options.text ?? "пост бота",
+      ...(options.buttonUrl
+        ? {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "Открыть", url: options.buttonUrl }],
+              ],
+            },
+          }
+        : {}),
+    },
+  } as Update;
+}
+
+function channelPostUpdate(options: {
+  edited?: boolean;
+  updateId: number;
+  messageId: number;
+  text: string;
+  link: string;
+}): Update {
+  const channel = {
+    id: -1001,
+    type: "channel" as const,
+    title: "Students Channel",
+    username: "students_channel",
+  };
+  const message = {
+    message_id: options.messageId,
+    date: options.updateId,
+    ...(options.edited ? { edit_date: options.updateId } : {}),
+    chat: channel,
+    sender_chat: channel,
+    text: options.text,
+    entities: urlEntities(options.text, [options.link]),
+  };
+
+  return options.edited
+    ? ({ update_id: options.updateId, edited_channel_post: message } as Update)
+    : ({ update_id: options.updateId, channel_post: message } as Update);
 }
 
 function anonymousOwnerLinkMessageUpdate(options: {
@@ -1476,7 +2087,7 @@ function forwardedGithubPostUpdate(): Update {
   } as Update;
 }
 
-function linkedChannelAutomaticForwardUpdate(): Update {
+function linkedChannelAutomaticForwardUpdate(buttonUrl?: string): Update {
   const sourceTitle = "Сухарев / ЙЙ";
   const text = `${sourceTitle}\nновый пост в канале`;
 
@@ -1507,6 +2118,11 @@ function linkedChannelAutomaticForwardUpdate(): Update {
           url: "https://t.me/sukharev_ii/12345",
         },
       ],
+      reply_markup: buttonUrl
+        ? {
+            inline_keyboard: [[{ text: "Открыть", url: buttonUrl }]],
+          }
+        : undefined,
     },
   } as Update;
 }
@@ -1620,6 +2236,7 @@ function reactionUpdate(
   newReaction: NonNullable<Update["message_reaction"]>["new_reaction"],
   options: {
     actorId?: number;
+    date?: number;
     messageId?: number;
   } = {},
 ): Update {
@@ -1628,7 +2245,7 @@ function reactionUpdate(
     message_reaction: {
       chat: chat(),
       message_id: options.messageId ?? 100,
-      date: updateId,
+      date: options.date ?? updateId,
       user: user(options.actorId ?? 20, "Дима"),
       old_reaction: oldReaction,
       new_reaction: newReaction,

@@ -1,4 +1,4 @@
-import { and, desc, eq, lt, sql } from "drizzle-orm";
+import { and, desc, eq, lt, ne, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type {
   CommunityBotRepository,
@@ -23,6 +23,7 @@ import {
 
 const UPDATE_RESERVATION_STALE_AFTER_MS = 120_000;
 const REACTION_RESERVATION_STALE_AFTER_MS = 120_000;
+const MODERATION_RESERVATION_STALE_AFTER_MS = 120_000;
 
 type D1RunResult = {
   meta?: {
@@ -252,8 +253,11 @@ export function createD1CommunityBotRepository(
     async getReactionVibeState(chatId, messageId, actorId): Promise<ReactionVibeState> {
       const rows = await db
         .select({
+          recipientUserId: reactionVibeStates.recipientUserId,
           positiveReactionCount: reactionVibeStates.positiveReactionCount,
           negativeReactionCount: reactionVibeStates.negativeReactionCount,
+          lastUpdateDate: reactionVibeStates.lastUpdateDate,
+          lastUpdateId: reactionVibeStates.lastUpdateId,
         })
         .from(reactionVibeStates)
         .where(
@@ -266,8 +270,17 @@ export function createD1CommunityBotRepository(
         .limit(1);
 
       return {
+        recipientUserId: rows[0]?.recipientUserId ?? null,
         positiveReactionCount: Number(rows[0]?.positiveReactionCount ?? 0),
         negativeReactionCount: Number(rows[0]?.negativeReactionCount ?? 0),
+        lastUpdateDate:
+          rows[0]?.lastUpdateDate === null || rows[0]?.lastUpdateDate === undefined
+            ? null
+            : Number(rows[0].lastUpdateDate),
+        lastUpdateId:
+          rows[0]?.lastUpdateId === null || rows[0]?.lastUpdateId === undefined
+            ? null
+            : Number(rows[0].lastUpdateId),
       };
     },
 
@@ -326,20 +339,6 @@ export function createD1CommunityBotRepository(
     },
 
     async setReactionVibeState(input) {
-      if (input.positiveReactionCount <= 0 && input.negativeReactionCount <= 0) {
-        await db
-          .delete(reactionVibeStates)
-          .where(
-            and(
-              eq(reactionVibeStates.chatId, input.chatId),
-              eq(reactionVibeStates.messageId, input.messageId),
-              eq(reactionVibeStates.actorId, input.actorId),
-            ),
-          )
-          .run();
-        return;
-      }
-
       await db
         .insert(reactionVibeStates)
         .values({
@@ -349,6 +348,8 @@ export function createD1CommunityBotRepository(
           recipientUserId: input.recipientUserId,
           positiveReactionCount: input.positiveReactionCount,
           negativeReactionCount: input.negativeReactionCount,
+          lastUpdateDate: input.lastUpdateDate,
+          lastUpdateId: input.lastUpdateId,
           updatedAt: nowIso(),
         })
         .onConflictDoUpdate({
@@ -361,29 +362,36 @@ export function createD1CommunityBotRepository(
             recipientUserId: input.recipientUserId,
             positiveReactionCount: input.positiveReactionCount,
             negativeReactionCount: input.negativeReactionCount,
+            lastUpdateDate: input.lastUpdateDate,
+            lastUpdateId: input.lastUpdateId,
             updatedAt: nowIso(),
           },
         })
         .run();
     },
 
-    async getMessageNegativeReactionCount(chatId, messageId) {
+    async getMessageNegativeReactionCount(chatId, messageId, excludedActorId) {
+      const conditions = [
+        eq(reactionVibeStates.chatId, chatId),
+        eq(reactionVibeStates.messageId, messageId),
+      ];
+      if (excludedActorId) {
+        conditions.push(ne(reactionVibeStates.actorId, excludedActorId));
+      }
+
       const rows = await db
         .select({
           count: sql<number>`coalesce(sum(${reactionVibeStates.negativeReactionCount}), 0)`,
         })
         .from(reactionVibeStates)
-        .where(
-          and(
-            eq(reactionVibeStates.chatId, chatId),
-            eq(reactionVibeStates.messageId, messageId),
-          ),
-        );
+        .where(and(...conditions));
 
       return Number(rows[0]?.count ?? 0);
     },
 
-    async addModerationAction(input: ModerationActionInput) {
+    async reserveModerationAction(input: ModerationActionInput) {
+      const timestamp = nowIso();
+      const reservationToken = crypto.randomUUID();
       const result = await db
         .insert(moderationActions)
         .values({
@@ -392,12 +400,85 @@ export function createD1CommunityBotRepository(
           action: input.action,
           targetUserId: input.targetUserId,
           targetMessageId: input.targetMessageId,
-          createdAt: nowIso(),
+          status: "processing",
+          reservationToken,
+          createdAt: timestamp,
+          updatedAt: timestamp,
         })
         .onConflictDoNothing()
         .run();
 
-      return didChange(result);
+      if (didChange(result)) {
+        return { ...input, status: "reserved", token: reservationToken };
+      }
+
+      const rows = await db
+        .select({ status: moderationActions.status })
+        .from(moderationActions)
+        .where(eq(moderationActions.idempotencyKey, input.idempotencyKey))
+        .limit(1);
+      if (rows[0]?.status === "completed") {
+        return { status: "completed" };
+      }
+
+      const staleBefore = new Date(
+        Date.now() - MODERATION_RESERVATION_STALE_AFTER_MS,
+      ).toISOString();
+      const reserved = await db
+        .update(moderationActions)
+        .set({
+          status: "processing",
+          reservationToken,
+          updatedAt: timestamp,
+        })
+        .where(
+          and(
+            eq(moderationActions.idempotencyKey, input.idempotencyKey),
+            eq(moderationActions.status, "processing"),
+            lt(moderationActions.updatedAt, staleBefore),
+          ),
+        )
+        .run();
+
+      return didChange(reserved)
+        ? { ...input, status: "reserved", token: reservationToken }
+        : { status: "processing" };
+    },
+
+    async completeModerationAction(reservation) {
+      const completed = await db
+        .update(moderationActions)
+        .set({
+          status: "completed",
+          reservationToken: null,
+          updatedAt: nowIso(),
+        })
+        .where(
+          and(
+            eq(moderationActions.idempotencyKey, reservation.idempotencyKey),
+            eq(moderationActions.status, "processing"),
+            eq(moderationActions.reservationToken, reservation.token),
+          ),
+        )
+        .run();
+      if (!didChange(completed)) {
+        throw new Error(
+          `Moderation action reservation was lost: ${reservation.idempotencyKey}`,
+        );
+      }
+    },
+
+    async releaseModerationAction(reservation) {
+      await db
+        .delete(moderationActions)
+        .where(
+          and(
+            eq(moderationActions.idempotencyKey, reservation.idempotencyKey),
+            eq(moderationActions.status, "processing"),
+            eq(moderationActions.reservationToken, reservation.token),
+          ),
+        )
+        .run();
     },
 
     async getVibeScore(chatId, userId) {

@@ -1,4 +1,6 @@
 import type {
+  InlineKeyboardButton,
+  InlineKeyboardMarkup,
   MessageEntity,
   MessageOrigin,
   ReactionCount,
@@ -76,6 +78,7 @@ export type TelegramLinkCarrier = {
   entities?: readonly MessageEntity[];
   caption_entities?: readonly MessageEntity[];
   forward_origin?: MessageOrigin | null;
+  reply_markup?: InlineKeyboardMarkup;
 };
 
 export function hasDisallowedTelegramLink(message: TelegramLinkCarrier): boolean {
@@ -85,8 +88,48 @@ export function hasDisallowedTelegramLink(message: TelegramLinkCarrier): boolean
       message.caption,
       message.caption_entities,
       message.forward_origin,
-    )
+    ) ||
+    hasDisallowedInlineKeyboardLink(message.reply_markup, message.forward_origin)
   );
+}
+
+function hasDisallowedInlineKeyboardLink(
+  replyMarkup: InlineKeyboardMarkup | undefined,
+  forwardOrigin: MessageOrigin | undefined | null,
+): boolean {
+  return replyMarkup?.inline_keyboard.some((row) => {
+    return row.some((button) => {
+      const value = getInlineKeyboardButtonUrl(button);
+      if (!value) {
+        return false;
+      }
+
+      const url = parseTelegramUrl(value);
+      return (
+        url !== null &&
+        (url.protocol === "http:" ||
+          url.protocol === "https:" ||
+          url.protocol === "tg:") &&
+        !isAllowedTelegramLink(value, forwardOrigin)
+      );
+    });
+  }) ?? false;
+}
+
+function getInlineKeyboardButtonUrl(button: InlineKeyboardButton): string | null {
+  if ("url" in button) {
+    return button.url;
+  }
+
+  if ("login_url" in button) {
+    return button.login_url.url;
+  }
+
+  if ("web_app" in button) {
+    return button.web_app.url;
+  }
+
+  return null;
 }
 
 function hasDisallowedLinkInText(
@@ -141,8 +184,20 @@ function isAllowedTelegramLink(
     isAllowedGithubUrl(value) ||
     isAllowedYoutubeUrl(value) ||
     isAllowedInstagramUrl(value) ||
+    isAllowedTelegramUserMentionUrl(value) ||
     isAllowedMainChannelTelegramUrl(value) ||
     isForwardOriginPermalink(value, forwardOrigin)
+  );
+}
+
+function isAllowedTelegramUserMentionUrl(value: string): boolean {
+  const url = parseTelegramUrl(value);
+  return (
+    url?.protocol === "tg:" &&
+    url.hostname.toLowerCase() === "user" &&
+    /^\d+$/u.test(url.searchParams.get("id") ?? "") &&
+    hasExactSearchParams(url, ["id"]) &&
+    url.hash === ""
   );
 }
 
@@ -182,18 +237,31 @@ function isAllowedInstagramUrl(value: string): boolean {
 
 function isAllowedMainChannelTelegramUrl(value: string): boolean {
   const url = parseTelegramUrl(value);
-  if (!url || url.protocol !== "https:") {
+  if (!url) {
     return false;
   }
 
-  if (url.hostname.toLowerCase() !== "t.me") {
-    return false;
+  if (url.protocol === "tg:" && url.hostname.toLowerCase() === "resolve") {
+    return (
+      normalizeTelegramUsername(url.searchParams.get("domain")) ===
+        MAIN_CHANNEL_USERNAME &&
+      isTelegramMessageId(url.searchParams.get("post")) &&
+      hasExactSearchParams(url, ["domain", "post"]) &&
+      url.hash === ""
+    );
   }
 
-  const [pathUsername, pathMessageId] = url.pathname.split("/").filter(Boolean);
+  if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "t.me") {
+    return false;
+  }
+  const pathParts = url.pathname.split("/").filter(Boolean);
+  const [pathUsername, pathMessageId] = pathParts;
   return (
+    pathParts.length === 2 &&
     normalizeTelegramUsername(pathUsername) === MAIN_CHANNEL_USERNAME &&
-    Boolean(pathMessageId)
+    isTelegramMessageId(pathMessageId) &&
+    url.search === "" &&
+    url.hash === ""
   );
 }
 
@@ -211,7 +279,20 @@ function isForwardOriginPermalink(
   }
 
   const url = parseTelegramUrl(value);
-  if (!url || (url.protocol !== "http:" && url.protocol !== "https:")) {
+  if (!url) {
+    return false;
+  }
+
+  if (url.protocol === "tg:" && url.hostname.toLowerCase() === "resolve") {
+    return (
+      normalizeTelegramUsername(url.searchParams.get("domain")) === username &&
+      url.searchParams.get("post") === String(forwardOrigin.message_id) &&
+      hasExactSearchParams(url, ["domain", "post"]) &&
+      url.hash === ""
+    );
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
     return false;
   }
 
@@ -220,15 +301,38 @@ function isForwardOriginPermalink(
     return false;
   }
 
-  const [pathUsername, pathMessageId] = url.pathname
-    .split("/")
-    .filter(Boolean);
+  const pathParts = url.pathname.split("/").filter(Boolean);
+  const [pathUsername, pathMessageId] = pathParts;
   if (normalizeTelegramUsername(pathUsername) !== username) {
     return false;
   }
 
   const messageId = String(forwardOrigin.message_id);
-  return pathMessageId === messageId || url.searchParams.get("id") === messageId;
+  const isPathPermalink =
+    pathParts.length === 2 &&
+    pathMessageId === messageId &&
+    url.search === "";
+  const isLegacyQueryPermalink =
+    pathParts.length === 1 &&
+    url.searchParams.get("id") === messageId &&
+    hasExactSearchParams(url, ["id"]);
+  return (isPathPermalink || isLegacyQueryPermalink) && url.hash === "";
+}
+
+function isTelegramMessageId(value: string | undefined | null): boolean {
+  return value !== null && value !== undefined && /^[1-9]\d*$/u.test(value);
+}
+
+function hasExactSearchParams(url: URL, expectedKeys: readonly string[]): boolean {
+  let count = 0;
+  let onlyExpectedKeys = true;
+  url.searchParams.forEach((_value, key) => {
+    count += 1;
+    if (!expectedKeys.includes(key)) {
+      onlyExpectedKeys = false;
+    }
+  });
+  return onlyExpectedKeys && count === expectedKeys.length;
 }
 
 function parseTelegramUrl(value: string): URL | null {

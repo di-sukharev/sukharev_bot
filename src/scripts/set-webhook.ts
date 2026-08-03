@@ -1,6 +1,8 @@
 const allowedUpdates = [
   "message",
   "edited_message",
+  "channel_post",
+  "edited_channel_post",
   "chat_member",
   "message_reaction",
   "message_reaction_count",

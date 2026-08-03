@@ -56,7 +56,8 @@ export type CommunityBotOptions = {
 const VIBE_TOP_LIMIT = 10;
 const LINK_PERMISSION_VIBE_THRESHOLD = 25;
 const AGGREGATE_REACTION_ACTOR_ID = "__reaction_count__";
-const NEGATIVE_DELETE_MESSAGE_THRESHOLD = 3;
+const UNKNOWN_MESSAGE_AUTHOR_ID = "__unknown_message_author__";
+const NEGATIVE_DELETE_MESSAGE_THRESHOLD = 5;
 const LOW_VIBE_WARNING_THRESHOLD = -5;
 const LOW_VIBE_BAN_THRESHOLD = -10;
 
@@ -245,9 +246,7 @@ export function createCommunityBot(
       chatId,
       reactionUpdate.message_id,
     );
-    if (!recipient || recipient.id === actorId) {
-      return;
-    }
+    const vibeRecipient = recipient && !recipient.isBot ? recipient : null;
 
     const reactionReservation = await ctx.repository.reserveReactionProcessing(
       chatId,
@@ -264,27 +263,48 @@ export function createCommunityBot(
         reactionUpdate.message_id,
         actorId,
       );
+      if (isStaleReactionUpdate(previousState, reactionUpdate.date, ctx.update.update_id)) {
+        return;
+      }
+
+      if (recipient?.id === actorId) {
+        await ctx.repository.setReactionVibeState({
+          chatId,
+          messageId: reactionUpdate.message_id,
+          actorId,
+          recipientUserId: recipient.id,
+          positiveReactionCount: 0,
+          negativeReactionCount: 0,
+          lastUpdateDate: reactionUpdate.date,
+          lastUpdateId: ctx.update.update_id,
+        });
+        return;
+      }
+
       const nextState = {
         positiveReactionCount: countPositiveReactions(reactionUpdate.new_reaction),
         negativeReactionCount: countNegativeReactions(reactionUpdate.new_reaction),
       };
       const deltas = getReactionStateDeltas(previousState, nextState);
-      if (!hasReactionStateChange(deltas)) {
-        return;
-      }
+      const vibeDelta = getRecipientVibeDelta(
+        previousState,
+        nextState,
+        vibeRecipient?.id ?? null,
+        deltas,
+      );
 
-      if (actorUser) {
+      if (actorUser && hasReactionStateChange(deltas)) {
         await ctx.repository.upsertUser(telegramUserToProfile(actorUser));
       }
 
-      const inserted = deltas.vibeDelta === 0
+      const inserted = vibeDelta === 0 || !vibeRecipient
         ? false
         : await ctx.repository.addVibeLedgerEntry({
             idempotencyKey: `reaction:${ctx.update.update_id}`,
             chatId,
-            recipientUserId: recipient.id,
+            recipientUserId: vibeRecipient.id,
             actorUserId: actorId,
-            delta: deltas.vibeDelta,
+            delta: vibeDelta,
             source: "message_reaction",
             reason: "reaction vibe delta",
             sourceMessageId: null,
@@ -295,21 +315,27 @@ export function createCommunityBot(
         chatId,
         messageId: reactionUpdate.message_id,
         actorId,
-        recipientUserId: recipient.id,
+        recipientUserId: recipient?.id ?? UNKNOWN_MESSAGE_AUTHOR_ID,
         ...nextState,
+        lastUpdateDate: reactionUpdate.date,
+        lastUpdateId: ctx.update.update_id,
       });
 
-      const currentScore = inserted
-        ? await ctx.repository.getVibeScore(chatId, recipient.id)
+      const currentScore = inserted && vibeRecipient
+        ? await ctx.repository.getVibeScore(chatId, vibeRecipient.id)
         : null;
 
-      if (inserted && shouldAnnounceReactionDelta(ctx.config, deltas)) {
+      if (
+        inserted &&
+        vibeRecipient &&
+        shouldAnnounceReactionDelta(ctx.config, deltas, vibeDelta)
+      ) {
         const sentMessage = await ctx.api.sendMessage(
           reactionUpdate.chat.id,
-          buildReactionVibeMessage(ctx, deltas.vibeDelta, recipient, currentScore),
+          buildReactionVibeMessage(ctx, vibeDelta, vibeRecipient, currentScore),
           replyToMessage(reactionUpdate.message_id),
         );
-        if (deltas.vibeDelta > 0) {
+        if (vibeDelta > 0) {
           await scheduleVibeNotificationDelete(
             env,
             {
@@ -321,7 +347,7 @@ export function createCommunityBot(
         }
       }
 
-      if (deltas.negativeDelta > 0) {
+      if (nextState.negativeReactionCount > 0) {
         await maybeDeleteNegativeModeratedMessage(
           ctx,
           reactionUpdate.chat.id,
@@ -330,12 +356,12 @@ export function createCommunityBot(
           recipient,
         );
       }
-      if (inserted && deltas.vibeDelta < 0) {
+      if (vibeRecipient) {
         await maybeBanForLowVibe(
           ctx,
           reactionUpdate.chat.id,
           chatId,
-          recipient,
+          vibeRecipient,
           currentScore,
         );
       }
@@ -351,9 +377,7 @@ export function createCommunityBot(
       chatId,
       reactionUpdate.message_id,
     );
-    if (!recipient) {
-      return;
-    }
+    const vibeRecipient = recipient && !recipient.isBot ? recipient : null;
 
     const reactionReservation = await ctx.repository.reserveReactionProcessing(
       chatId,
@@ -370,23 +394,30 @@ export function createCommunityBot(
         reactionUpdate.message_id,
         AGGREGATE_REACTION_ACTOR_ID,
       );
+      if (isStaleReactionUpdate(previousState, reactionUpdate.date, ctx.update.update_id)) {
+        return;
+      }
+
       const nextState = {
         positiveReactionCount: countPositiveReactionTotal(reactionUpdate.reactions),
         negativeReactionCount: countNegativeReactionTotal(reactionUpdate.reactions),
       };
       const deltas = getReactionStateDeltas(previousState, nextState);
-      if (!hasReactionStateChange(deltas)) {
-        return;
-      }
+      const vibeDelta = getRecipientVibeDelta(
+        previousState,
+        nextState,
+        vibeRecipient?.id ?? null,
+        deltas,
+      );
 
-      const inserted = deltas.vibeDelta === 0
+      const inserted = vibeDelta === 0 || !vibeRecipient
         ? false
         : await ctx.repository.addVibeLedgerEntry({
             idempotencyKey: `reaction_count:${ctx.update.update_id}`,
             chatId,
-            recipientUserId: recipient.id,
+            recipientUserId: vibeRecipient.id,
             actorUserId: null,
-            delta: deltas.vibeDelta,
+            delta: vibeDelta,
             source: "message_reaction",
             reason: "reaction count vibe delta",
             sourceMessageId: null,
@@ -397,21 +428,27 @@ export function createCommunityBot(
         chatId,
         messageId: reactionUpdate.message_id,
         actorId: AGGREGATE_REACTION_ACTOR_ID,
-        recipientUserId: recipient.id,
+        recipientUserId: recipient?.id ?? UNKNOWN_MESSAGE_AUTHOR_ID,
         ...nextState,
+        lastUpdateDate: reactionUpdate.date,
+        lastUpdateId: ctx.update.update_id,
       });
 
-      const currentScore = inserted
-        ? await ctx.repository.getVibeScore(chatId, recipient.id)
+      const currentScore = inserted && vibeRecipient
+        ? await ctx.repository.getVibeScore(chatId, vibeRecipient.id)
         : null;
 
-      if (inserted && shouldAnnounceReactionDelta(ctx.config, deltas)) {
+      if (
+        inserted &&
+        vibeRecipient &&
+        shouldAnnounceReactionDelta(ctx.config, deltas, vibeDelta)
+      ) {
         const sentMessage = await ctx.api.sendMessage(
           reactionUpdate.chat.id,
-          buildReactionVibeMessage(ctx, deltas.vibeDelta, recipient, currentScore),
+          buildReactionVibeMessage(ctx, vibeDelta, vibeRecipient, currentScore),
           replyToMessage(reactionUpdate.message_id),
         );
-        if (deltas.vibeDelta > 0) {
+        if (vibeDelta > 0) {
           await scheduleVibeNotificationDelete(
             env,
             {
@@ -423,7 +460,7 @@ export function createCommunityBot(
         }
       }
 
-      if (deltas.negativeDelta > 0) {
+      if (nextState.negativeReactionCount > 0) {
         await maybeDeleteNegativeModeratedMessage(
           ctx,
           reactionUpdate.chat.id,
@@ -432,12 +469,12 @@ export function createCommunityBot(
           recipient,
         );
       }
-      if (inserted && deltas.vibeDelta < 0) {
+      if (vibeRecipient) {
         await maybeBanForLowVibe(
           ctx,
           reactionUpdate.chat.id,
           chatId,
-          recipient,
+          vibeRecipient,
           currentScore,
         );
       }
@@ -448,18 +485,21 @@ export function createCommunityBot(
 
   bot.on("message", async (ctx) => {
     const message = ctx.message;
-    if (message.from && !message.from.is_bot && !message.sender_chat) {
-      const author = telegramUserToProfile(message.from);
-      await ctx.repository.upsertUser(author);
-      await ctx.repository.storeMessage({
-        chatId: String(message.chat.id),
-        messageId: message.message_id,
-        authorUserId: author.id,
-        sentAt: message.date ?? null,
-      });
-    }
+    await storeReactionModeratedMessage(ctx, message);
 
     await maybeAwardThanksReply(ctx, message, env);
+  });
+
+  bot.on("edited_message", async (ctx) => {
+    await storeReactionModeratedMessage(ctx, ctx.editedMessage);
+  });
+
+  bot.on("channel_post", async (ctx) => {
+    await storeReactionModeratedMessage(ctx, ctx.channelPost);
+  });
+
+  bot.on("edited_channel_post", async (ctx) => {
+    await storeReactionModeratedMessage(ctx, ctx.editedChannelPost);
   });
 
   return bot;
@@ -505,9 +545,14 @@ type ReactionStateDeltas = {
   vibeDelta: number;
 };
 
+type ReactionCounts = Pick<
+  ReactionVibeState,
+  "positiveReactionCount" | "negativeReactionCount"
+>;
+
 function getReactionStateDeltas(
-  previousState: ReactionVibeState,
-  nextState: ReactionVibeState,
+  previousState: ReactionCounts,
+  nextState: ReactionCounts,
 ): ReactionStateDeltas {
   const positiveDelta =
     nextState.positiveReactionCount - previousState.positiveReactionCount;
@@ -520,17 +565,57 @@ function getReactionStateDeltas(
   };
 }
 
+function getRecipientVibeDelta(
+  previousState: ReactionVibeState,
+  nextState: ReactionCounts,
+  recipientUserId: string | null,
+  deltas: ReactionStateDeltas,
+): number {
+  if (!recipientUserId) {
+    return 0;
+  }
+
+  if (
+    previousState.recipientUserId === null ||
+    previousState.recipientUserId === recipientUserId
+  ) {
+    return deltas.vibeDelta;
+  }
+
+  // Reactions observed before an eligible author was known were never written
+  // to the vibe ledger. Rebase the new author's state from an unawarded zero
+  // baseline so later removals cannot create unearned vibe.
+  return nextState.positiveReactionCount - nextState.negativeReactionCount;
+}
+
 function hasReactionStateChange(deltas: ReactionStateDeltas): boolean {
   return deltas.positiveDelta !== 0 || deltas.negativeDelta !== 0;
+}
+
+function isStaleReactionUpdate(
+  previousState: ReactionVibeState,
+  updateDate: number,
+  updateId: number,
+): boolean {
+  if (previousState.lastUpdateDate !== null) {
+    if (updateDate !== previousState.lastUpdateDate) {
+      return updateDate < previousState.lastUpdateDate;
+    }
+
+    return previousState.lastUpdateId !== null && updateId < previousState.lastUpdateId;
+  }
+
+  return previousState.lastUpdateId !== null && updateId < previousState.lastUpdateId;
 }
 
 function shouldAnnounceReactionDelta(
   config: RuntimeConfig,
   deltas: ReactionStateDeltas,
+  vibeDelta: number,
 ): boolean {
   return (
     config.announceReactions &&
-    deltas.vibeDelta !== 0 &&
+    vibeDelta !== 0 &&
     (deltas.positiveDelta > 0 || deltas.negativeDelta > 0)
   );
 }
@@ -540,14 +625,18 @@ async function maybeDeleteNegativeModeratedMessage(
   apiChatId: number | string,
   chatId: string,
   messageId: number,
-  recipient: TelegramUserProfile,
+  recipient: TelegramUserProfile | null,
 ): Promise<void> {
-  if (recipient.isBot || ctx.config.ownerUserIds.has(recipient.id)) {
+  if (recipient && ctx.config.ownerUserIds.has(recipient.id)) {
     return;
   }
 
   const messageNegativeReactionCount =
-    await ctx.repository.getMessageNegativeReactionCount(chatId, messageId);
+    await ctx.repository.getMessageNegativeReactionCount(
+      chatId,
+      messageId,
+      recipient?.id ?? null,
+    );
   if (messageNegativeReactionCount >= NEGATIVE_DELETE_MESSAGE_THRESHOLD) {
     await runModerationAction(
       ctx,
@@ -555,11 +644,11 @@ async function maybeDeleteNegativeModeratedMessage(
         idempotencyKey: `delete_message:${chatId}:${messageId}`,
         chatId,
         action: "delete_message",
-        targetUserId: recipient.id,
+        targetUserId: recipient?.id ?? null,
         targetMessageId: messageId,
       },
       async () => {
-        await ctx.api.deleteMessage(apiChatId, messageId);
+        await deleteModeratedMessage(ctx, apiChatId, messageId);
       },
     );
   }
@@ -633,17 +722,23 @@ async function deleteProfanityMessage(
       targetMessageId: message.message_id,
     },
     async () => {
-      await ctx.api.deleteMessage(message.chat.id, message.message_id);
-      await ctx.api.sendMessage(
-        message.chat.id,
-        buildProfanityModerationWarning(ctx, message, author, currentScore),
-      );
+      await deleteModeratedMessage(ctx, message.chat.id, message.message_id);
     },
   );
+  await sendModerationWarning(
+    ctx,
+    {
+      idempotencyKey: `send_warning:profanity:${chatId}:${message.message_id}`,
+      chatId,
+      action: "send_warning",
+      targetUserId: author.id,
+      targetMessageId: message.message_id,
+    },
+    message.chat.id,
+    buildProfanityModerationWarning(ctx, message, author, currentScore),
+  );
 
-  if (inserted) {
-    await maybeBanForLowVibe(ctx, message.chat.id, chatId, author, currentScore);
-  }
+  await maybeBanForLowVibe(ctx, message.chat.id, chatId, author, currentScore);
 }
 
 function buildReactionVibeMessage(
@@ -727,6 +822,44 @@ function getMessageText(message: Message): string | null {
   return null;
 }
 
+async function storeReactionModeratedMessage(
+  ctx: CommunityBotContext,
+  message: Message,
+): Promise<void> {
+  const author = getReactionModeratedMessageAuthor(message);
+  if (!author) {
+    return;
+  }
+
+  await ctx.repository.upsertUser(author);
+  await ctx.repository.storeMessage({
+    chatId: String(message.chat.id),
+    messageId: message.message_id,
+    authorUserId: author.id,
+    sentAt: message.date ?? null,
+  });
+}
+
+function getReactionModeratedMessageAuthor(
+  message: Message,
+): TelegramUserProfile | null {
+  if (message.sender_chat) {
+    const senderChat = telegramChatToProfile(message.sender_chat);
+    return {
+      id: `chat:${senderChat.id}`,
+      username: senderChat.username,
+      firstName: null,
+      lastName: null,
+      displayName:
+        senderChat.title ??
+        (senderChat.username ? `@${senderChat.username}` : `chat ${senderChat.id}`),
+      isBot: true,
+    };
+  }
+
+  return message.from ? telegramUserToProfile(message.from) : null;
+}
+
 async function getDisallowedLinkMessage(
   ctx: CommunityBotContext,
 ): Promise<Message | null> {
@@ -742,6 +875,20 @@ async function getDisallowedLinkMessage(
     (await shouldDeleteDisallowedLink(ctx.update.edited_message, ctx))
   ) {
     return ctx.update.edited_message;
+  }
+
+  if (
+    ctx.update.channel_post &&
+    (await shouldDeleteDisallowedLink(ctx.update.channel_post, ctx))
+  ) {
+    return ctx.update.channel_post;
+  }
+
+  if (
+    ctx.update.edited_channel_post &&
+    (await shouldDeleteDisallowedLink(ctx.update.edited_channel_post, ctx))
+  ) {
+    return ctx.update.edited_channel_post;
   }
 
   return null;
@@ -760,6 +907,20 @@ function getProfanityModeratedMessage(
     shouldDeleteProfanityMessage(update.edited_message, config)
   ) {
     return update.edited_message;
+  }
+
+  if (
+    update.channel_post &&
+    shouldDeleteProfanityMessage(update.channel_post, config)
+  ) {
+    return update.channel_post;
+  }
+
+  if (
+    update.edited_channel_post &&
+    shouldDeleteProfanityMessage(update.edited_channel_post, config)
+  ) {
+    return update.edited_channel_post;
   }
 
   return null;
@@ -793,7 +954,6 @@ async function shouldDeleteDisallowedLink(
   ctx: CommunityBotContext,
 ): Promise<boolean> {
   if (
-    isAutomaticDiscussionForward(message) ||
     canSendDisallowedLinks(message, ctx.config) ||
     !hasDisallowedTelegramLink(message)
   ) {
@@ -805,10 +965,6 @@ async function shouldDeleteDisallowedLink(
 
 function canSendDisallowedLinks(message: Message, config: RuntimeConfig): boolean {
   return isLinkAllowedUser(message.from, config);
-}
-
-function isAutomaticDiscussionForward(message: Message): boolean {
-  return message.is_automatic_forward === true;
 }
 
 function isLinkAllowedUser(
@@ -864,12 +1020,20 @@ async function deleteDisallowedLinkMessage(
       targetMessageId: message.message_id,
     },
     async () => {
-      await ctx.api.deleteMessage(message.chat.id, message.message_id);
-      await ctx.api.sendMessage(
-        message.chat.id,
-        buildLinkModerationWarning(message),
-      );
+      await deleteModeratedMessage(ctx, message.chat.id, message.message_id);
     },
+  );
+  await sendModerationWarning(
+    ctx,
+    {
+      idempotencyKey: `send_warning:link:${chatId}:${message.message_id}`,
+      chatId,
+      action: "send_warning",
+      targetUserId: message.from ? String(message.from.id) : null,
+      targetMessageId: message.message_id,
+    },
+    message.chat.id,
+    buildLinkModerationWarning(message),
   );
 }
 
@@ -895,23 +1059,76 @@ function buildUserAddressedModerationWarning(
 
 async function runModerationAction(
   ctx: CommunityBotContext,
-  input: Parameters<CommunityBotRepository["addModerationAction"]>[0],
+  input: Parameters<CommunityBotRepository["reserveModerationAction"]>[0],
   action: () => Promise<void>,
-): Promise<void> {
-  const inserted = await ctx.repository.addModerationAction(input);
-  if (!inserted) {
-    return;
+): Promise<boolean> {
+  const reservation = await ctx.repository.reserveModerationAction(input);
+  if (reservation.status === "completed") {
+    return false;
+  }
+  if (reservation.status === "processing") {
+    throw new Error(`Moderation action is already reserved: ${input.idempotencyKey}`);
   }
 
   try {
     await action();
   } catch (error) {
+    await ctx.repository.releaseModerationAction(reservation);
     console.error("Telegram moderation action failed", {
       idempotencyKey: input.idempotencyKey,
       action: input.action,
       error: getErrorMessage(error),
     });
+    throw error;
   }
+
+  await ctx.repository.completeModerationAction(reservation);
+  return true;
+}
+
+async function sendModerationWarning(
+  ctx: CommunityBotContext,
+  input: Parameters<CommunityBotRepository["reserveModerationAction"]>[0],
+  chatId: number | string,
+  text: string,
+): Promise<void> {
+  await runModerationAction(ctx, input, async () => {
+    await ctx.api.sendMessage(chatId, text);
+  });
+}
+
+async function deleteModeratedMessage(
+  ctx: CommunityBotContext,
+  chatId: number | string,
+  messageId: number,
+): Promise<void> {
+  try {
+    await ctx.api.deleteMessage(chatId, messageId);
+  } catch (error) {
+    if (isTerminalDeleteError(error)) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+function isTerminalDeleteError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const telegramError = error as { error_code?: number; description?: string };
+  if (telegramError.error_code !== 400 || !telegramError.description) {
+    return false;
+  }
+
+  const description = telegramError.description.toLowerCase();
+  return (
+    description.includes("message to delete not found") ||
+    description.includes("message can't be deleted") ||
+    description.includes("message cannot be deleted")
+  );
 }
 
 function getErrorMessage(error: unknown): string {
@@ -1024,6 +1241,14 @@ function getUpdateChat(update: Update): Chat | null {
 
   if (update.edited_message) {
     return update.edited_message.chat;
+  }
+
+  if (update.channel_post) {
+    return update.channel_post.chat;
+  }
+
+  if (update.edited_channel_post) {
+    return update.edited_channel_post.chat;
   }
 
   if (update.chat_member) {

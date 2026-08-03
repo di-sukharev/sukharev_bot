@@ -219,6 +219,125 @@ describe("vibe rules", () => {
         ],
       }),
     ).toBe(false);
+    expect(
+      hasDisallowedTelegramLink({
+        text: "подозрительный профиль",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Пользователь",
+                url: "tg://user?id=123&extra=1",
+              },
+            ],
+          ],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink({
+        text: "другой канал",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Открыть",
+                url: "tg://resolve?domain=other_channel&post=123",
+              },
+            ],
+          ],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink({
+        text: "настроить прокси",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "Подключить", url: "tg://proxy?server=example.com&port=443" }],
+          ],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink({
+        text: "основной канал",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Открыть",
+                url: "tg://resolve?domain=sukharev_ii&post=123",
+              },
+            ],
+          ],
+        },
+      }),
+    ).toBe(false);
+  });
+
+  test("detects forbidden links in inline keyboard buttons", () => {
+    expect(
+      hasDisallowedTelegramLink({
+        text: "получить подарок",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "Открыть", url: "https://example.com/claim" }],
+          ],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink({
+        text: "исходники",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "GitHub", url: "https://github.com/openai/codex" }],
+            [{ text: "Действие", callback_data: "safe" }],
+          ],
+        },
+      }),
+    ).toBe(false);
+    expect(
+      hasDisallowedTelegramLink({
+        text: "профиль",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "Пользователь", url: "tg://user?id=123" }],
+          ],
+        },
+      }),
+    ).toBe(false);
+    expect(
+      hasDisallowedTelegramLink({
+        text: "авторизация",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Войти",
+                login_url: { url: "https://example.com/login" },
+              },
+            ],
+          ],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink({
+        text: "приложение",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Открыть",
+                web_app: { url: "https://example.com/app" },
+              },
+            ],
+          ],
+        },
+      }),
+    ).toBe(true);
   });
 
   test("ignores only the exact Telegram source permalink on forwarded posts", () => {
@@ -247,6 +366,24 @@ describe("vibe rules", () => {
       hasDisallowedTelegramLink({
         ...forwardedGithubPost,
         entities: [
+          textLinkEntity(text, "repo", "https://github.com/di-sukharev/vibe"),
+        ],
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Другой канал",
+                url: "https://t.me/other_channel/12345",
+              },
+            ],
+          ],
+        },
+      }),
+    ).toBe(false);
+    expect(
+      hasDisallowedTelegramLink({
+        ...forwardedGithubPost,
+        entities: [
           textLinkEntity(text, "Другой канал", "https://t.me/other_channel/54321"),
           textLinkEntity(text, "repo", "https://github.com/di-sukharev/vibe"),
         ],
@@ -261,6 +398,44 @@ describe("vibe rules", () => {
         ],
       }),
     ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink({
+        ...forwardedGithubPost,
+        entities: [
+          textLinkEntity(
+            text,
+            "Другой канал",
+            "https://t.me/other_channel/12345/extra",
+          ),
+          textLinkEntity(text, "repo", "https://github.com/di-sukharev/vibe"),
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink({
+        ...forwardedGithubPost,
+        entities: [
+          textLinkEntity(
+            text,
+            "Другой канал",
+            "tg://resolve?domain=other_channel&post=12345&extra=1",
+          ),
+          textLinkEntity(text, "repo", "https://github.com/di-sukharev/vibe"),
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  test("rejects malformed or extended main-channel permalinks", () => {
+    for (const url of [
+      "https://t.me/sukharev_ii/not-a-message",
+      "https://t.me/sukharev_ii/123/extra",
+      "https://t.me/sukharev_ii/123?next=evil",
+      "tg://resolve?domain=sukharev_ii&post=not-a-message",
+      "tg://resolve?domain=sukharev_ii&post=123&extra=1",
+    ]) {
+      expect(hasDisallowedTelegramLink(urlLinkCarrier(url))).toBe(true);
+    }
   });
 
   test("counts only supported positive emoji reactions", () => {

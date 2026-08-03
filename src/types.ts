@@ -67,8 +67,11 @@ export type VibeTopEntry = {
 };
 
 export type ReactionVibeState = {
+  recipientUserId: string | null;
   positiveReactionCount: number;
   negativeReactionCount: number;
+  lastUpdateDate: number | null;
+  lastUpdateId: number | null;
 };
 
 export type ReactionVibeStateInput = {
@@ -78,6 +81,8 @@ export type ReactionVibeStateInput = {
   recipientUserId: string;
   positiveReactionCount: number;
   negativeReactionCount: number;
+  lastUpdateDate: number;
+  lastUpdateId: number;
 };
 
 export type ReservedUpdateProcessing = {
@@ -101,10 +106,20 @@ export type ReactionProcessingReservation = {
 export type ModerationActionInput = {
   idempotencyKey: string;
   chatId: string;
-  action: "delete_message" | "ban_user";
+  action: "delete_message" | "ban_user" | "send_warning";
   targetUserId: string | null;
   targetMessageId: number | null;
 };
+
+export type ModerationActionReservation = ModerationActionInput & {
+  status: "reserved";
+  token: string;
+};
+
+export type ModerationActionReservationResult =
+  | ModerationActionReservation
+  | { status: "completed" }
+  | { status: "processing" };
 
 export type CommunityBotRepository = {
   reserveUpdateProcessing(updateId: number): Promise<UpdateProcessingReservation>;
@@ -132,8 +147,20 @@ export type CommunityBotRepository = {
   releaseReactionProcessing(
     reservation: ReactionProcessingReservation,
   ): Promise<void>;
-  getMessageNegativeReactionCount(chatId: string, messageId: number): Promise<number>;
-  addModerationAction(input: ModerationActionInput): Promise<boolean>;
+  getMessageNegativeReactionCount(
+    chatId: string,
+    messageId: number,
+    excludedActorId: string | null,
+  ): Promise<number>;
+  reserveModerationAction(
+    input: ModerationActionInput,
+  ): Promise<ModerationActionReservationResult>;
+  completeModerationAction(
+    reservation: ModerationActionReservation,
+  ): Promise<void>;
+  releaseModerationAction(
+    reservation: ModerationActionReservation,
+  ): Promise<void>;
   getVibeScore(chatId: string, userId: string): Promise<number>;
   getVibeTop(chatId: string, limit: number): Promise<VibeTopEntry[]>;
 };

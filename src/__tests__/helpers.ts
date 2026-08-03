@@ -1,6 +1,7 @@
 import type {
   CommunityBotRepository,
   ModerationActionInput,
+  ModerationActionReservation,
   ReactionVibeState,
   ReactionVibeStateInput,
   StoredTelegramMessage,
@@ -137,6 +138,10 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
   readonly reactionStates = new Map<string, ReactionVibeStateInput>();
   readonly reactionAwardReservations = new Map<string, string>();
   readonly moderationActions = new Map<string, ModerationActionInput>();
+  readonly moderationActionReservations = new Map<
+    string,
+    ModerationActionReservation
+  >();
 
   async reserveUpdateProcessing(updateId: number) {
     if (this.processedUpdates.has(updateId)) {
@@ -216,8 +221,11 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
   ): Promise<ReactionVibeState> {
     const state = this.reactionStates.get(reactionAwardKey(chatId, messageId, actorId));
     return {
+      recipientUserId: state?.recipientUserId ?? null,
       positiveReactionCount: state?.positiveReactionCount ?? 0,
       negativeReactionCount: state?.negativeReactionCount ?? 0,
+      lastUpdateDate: state?.lastUpdateDate ?? null,
+      lastUpdateId: state?.lastUpdateId ?? null,
     };
   }
 
@@ -259,27 +267,67 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
 
   async setReactionVibeState(input: ReactionVibeStateInput): Promise<void> {
     const key = reactionAwardKey(input.chatId, input.messageId, input.actorId);
-    if (input.positiveReactionCount <= 0 && input.negativeReactionCount <= 0) {
-      this.reactionStates.delete(key);
-      return;
-    }
-
     this.reactionStates.set(key, input);
   }
 
-  async getMessageNegativeReactionCount(chatId: string, messageId: number): Promise<number> {
+  async getMessageNegativeReactionCount(
+    chatId: string,
+    messageId: number,
+    excludedActorId: string | null,
+  ): Promise<number> {
     return [...this.reactionStates.values()]
-      .filter((state) => state.chatId === chatId && state.messageId === messageId)
+      .filter((state) => {
+        return (
+          state.chatId === chatId &&
+          state.messageId === messageId &&
+          state.actorId !== excludedActorId
+        );
+      })
       .reduce((sum, state) => sum + state.negativeReactionCount, 0);
   }
 
-  async addModerationAction(input: ModerationActionInput): Promise<boolean> {
+  async reserveModerationAction(input: ModerationActionInput) {
     if (this.moderationActions.has(input.idempotencyKey)) {
-      return false;
+      return { status: "completed" as const };
+    }
+    if (this.moderationActionReservations.has(input.idempotencyKey)) {
+      return { status: "processing" as const };
     }
 
-    this.moderationActions.set(input.idempotencyKey, input);
-    return true;
+    const reservation = {
+      ...input,
+      status: "reserved" as const,
+      token: `moderation-reservation-${this.moderationActionReservations.size}`,
+    };
+    this.moderationActionReservations.set(input.idempotencyKey, reservation);
+    return reservation;
+  }
+
+  async completeModerationAction(
+    reservation: ModerationActionReservation,
+  ): Promise<void> {
+    if (
+      this.moderationActionReservations.get(reservation.idempotencyKey)?.token !==
+      reservation.token
+    ) {
+      throw new Error(
+        `Moderation action reservation was lost: ${reservation.idempotencyKey}`,
+      );
+    }
+
+    this.moderationActionReservations.delete(reservation.idempotencyKey);
+    this.moderationActions.set(reservation.idempotencyKey, reservation);
+  }
+
+  async releaseModerationAction(
+    reservation: ModerationActionReservation,
+  ): Promise<void> {
+    if (
+      this.moderationActionReservations.get(reservation.idempotencyKey)?.token ===
+      reservation.token
+    ) {
+      this.moderationActionReservations.delete(reservation.idempotencyKey);
+    }
   }
 
   async getVibeScore(chatId: string, userId: string): Promise<number> {

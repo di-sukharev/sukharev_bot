@@ -83,6 +83,8 @@ export const reactionVibeStates = sqliteTable(
     positiveReactionCount: integer("positive_reaction_count").notNull(),
     // SQL keeps the original poop-only column name; runtime treats it as all negative reactions.
     negativeReactionCount: integer("poop_reaction_count").notNull(),
+    lastUpdateDate: integer("last_update_date"),
+    lastUpdateId: integer("last_update_id"),
     updatedAt: text("updated_at").notNull(),
   },
   (table) => ({
@@ -114,5 +116,8 @@ export const moderationActions = sqliteTable("moderation_actions", {
   action: text("action").notNull(),
   targetUserId: text("target_user_id"),
   targetMessageId: integer("target_message_id"),
+  status: text("status").notNull().default("completed"),
+  reservationToken: text("reservation_token"),
+  updatedAt: text("updated_at"),
   createdAt: text("created_at").notNull(),
 });
