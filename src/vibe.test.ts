@@ -158,6 +158,67 @@ describe("vibe rules", () => {
     ).toBe(true);
   });
 
+  test("allows only exact message links from the current private group", () => {
+    const currentGroup = { id: -1003707812387, type: "supergroup" as const };
+
+    for (const url of [
+      "https://t.me/c/3707812387/20908",
+      "https://t.me/c/3707812387/20910",
+      "https://t.me/c/3707812387/20908?single",
+      "https://t.me/c/3707812387/20908?thread=20900",
+      "https://t.me/c/3707812387/20900/20908",
+      "https://t.me/c/3707812387/20900/20908?single&t=10%3A23&task=2&option=YWJj",
+      "tg://privatepost?channel=3707812387&post=20908",
+      "tg://privatepost?channel=3707812387&post=20908&single&thread=20900",
+    ]) {
+      expect(
+        hasDisallowedTelegramLink({
+          ...urlLinkCarrier(url),
+          chat: currentGroup,
+        }),
+      ).toBe(false);
+    }
+
+    for (const url of [
+      "https://t.me/c/3707812388/20908",
+      "http://t.me/c/3707812387/20908",
+      "https://t.me/c/3707812387/not-a-message",
+      "https://t.me/c/3707812387/20908/extra",
+      "https://t.me/c/3707812387/20908?next=evil",
+      "https://t.me/c/3707812387/20908?single=value",
+      "https://t.me/c/3707812387/20908?thread=not-a-message",
+      "https://t.me/c/3707812387/20900/20908?thread=20900",
+      "https://t.me/c/3707812387/20908?comment=42",
+      "https://t.me/c/3707812387/20908?single&single",
+      "https://t.me/c/3707812387/20908?t=soon",
+      "https://t.me/c/3707812387/20908?option=%25%25%25",
+      "https://t.me/c/3707812387/20908#fragment",
+      "tg://privatepost?channel=3707812388&post=20908",
+      "tg://privatepost?channel=3707812387&post=not-a-message",
+      "tg://privatepost?channel=3707812387",
+      "tg://privatepost/extra?channel=3707812387&post=20908",
+    ]) {
+      expect(
+        hasDisallowedTelegramLink({
+          ...urlLinkCarrier(url),
+          chat: currentGroup,
+        }),
+      ).toBe(true);
+    }
+
+    expect(
+      hasDisallowedTelegramLink(
+        urlLinkCarrier("https://t.me/c/3707812387/20908"),
+      ),
+    ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink({
+        ...urlLinkCarrier("https://t.me/c/3707812387/20908"),
+        chat: { ...currentGroup, type: "channel" },
+      }),
+    ).toBe(true);
+  });
+
   test("ignores Cyrillic URL entities from Telegram autolinking", () => {
     expect(
       hasDisallowedTelegramLink(

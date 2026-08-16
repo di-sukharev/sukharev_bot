@@ -441,11 +441,20 @@ describe("community bot", () => {
         link: "https://example.org/claim",
       }),
     );
+    await bot.handleUpdate(
+      channelPostUpdate({
+        updateId: 32,
+        messageId: 332,
+        text: "пост https://t.me/c/1/119",
+        link: "https://t.me/c/1/119",
+      }),
+    );
 
-    expect(telegramMethodRequests("deleteMessage")).toHaveLength(2);
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(3);
     expect(telegramMethodRequests("deleteMessage").map((request) => request.body)).toEqual([
       expect.objectContaining({ message_id: 330 }),
       expect.objectContaining({ message_id: 331 }),
+      expect.objectContaining({ message_id: 332 }),
     ]);
   });
 
@@ -531,6 +540,30 @@ describe("community bot", () => {
           "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
           "https://www.instagram.com/p/C0ffeeCode/",
           "https://t.me/sukharev_ii/123",
+        ],
+      }),
+    );
+
+    expect(repository.messages.size).toBe(1);
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+    expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
+  });
+
+  test("keeps message links from the same private group", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      linkMessageUpdate({
+        text:
+          "выше уже обсуждали https://t.me/c/1/119?single, https://t.me/c/1/118/120 и tg://privatepost?channel=1&post=121",
+        links: [
+          "https://t.me/c/1/119?single",
+          "https://t.me/c/1/118/120",
+          "tg://privatepost?channel=1&post=121",
         ],
       }),
     );
