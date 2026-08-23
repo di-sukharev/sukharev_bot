@@ -626,7 +626,7 @@ describe("community bot", () => {
     expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
   });
 
-  test("deletes forbidden buttons from automatic discussion forwards", async () => {
+  test("keeps forbidden links from main-channel automatic discussion forwards", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const bot = createCommunityBot(createTestEnv(), {
       repository,
@@ -634,11 +634,36 @@ describe("community bot", () => {
     });
 
     await bot.handleUpdate(
-      linkedChannelAutomaticForwardUpdate("https://example.com/claim"),
+      linkedChannelAutomaticForwardUpdate({
+        externalLink: "https://vibe.sukharev.dev/",
+        buttonUrl: "https://example.com/claim",
+      }),
     );
 
-    expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
+    expect(repository.messages.size).toBe(1);
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
+    expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
+  });
+
+  test("still deletes forbidden links from other automatic channel forwards", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const bot = createCommunityBot(createTestEnv(), {
+      repository,
+      apiFetch: fetchMock.fetch,
+    });
+
+    await bot.handleUpdate(
+      linkedChannelAutomaticForwardUpdate({
+        channelUsername: "other_channel",
+        externalLink: "https://example.com/claim",
+      }),
+    );
+
     expect(repository.messages.size).toBe(0);
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
+    expect(telegramMethodRequests("sendMessage").at(-1)?.body).toMatchObject({
+      text: expect.stringContaining(LINK_MODERATION_MESSAGE),
+    });
   });
 
   test("deletes a message with a deceptive GitHub-looking host", async () => {
@@ -2120,9 +2145,18 @@ function forwardedGithubPostUpdate(): Update {
   } as Update;
 }
 
-function linkedChannelAutomaticForwardUpdate(buttonUrl?: string): Update {
+function linkedChannelAutomaticForwardUpdate(
+  options: {
+    buttonUrl?: string;
+    channelUsername?: string;
+    externalLink?: string;
+  } = {},
+): Update {
   const sourceTitle = "Сухарев / ЙЙ";
-  const text = `${sourceTitle}\nновый пост в канале`;
+  const text = [sourceTitle, "новый пост в канале", options.externalLink]
+    .filter(Boolean)
+    .join("\n");
+  const channelUsername = options.channelUsername ?? "sukharev_ii";
 
   return {
     update_id: 27,
@@ -2139,7 +2173,7 @@ function linkedChannelAutomaticForwardUpdate(buttonUrl?: string): Update {
         id: -10012345,
         type: "channel",
         title: sourceTitle,
-        username: "sukharev_ii",
+        username: channelUsername,
       },
       is_automatic_forward: true,
       text,
@@ -2148,12 +2182,15 @@ function linkedChannelAutomaticForwardUpdate(buttonUrl?: string): Update {
           type: "text_link",
           offset: text.indexOf(sourceTitle),
           length: sourceTitle.length,
-          url: "https://t.me/sukharev_ii/12345",
+          url: `https://t.me/${channelUsername}/12345`,
         },
+        ...(options.externalLink
+          ? urlEntities(text, [options.externalLink])
+          : []),
       ],
-      reply_markup: buttonUrl
+      reply_markup: options.buttonUrl
         ? {
-            inline_keyboard: [[{ text: "Открыть", url: buttonUrl }]],
+            inline_keyboard: [[{ text: "Открыть", url: options.buttonUrl }]],
           }
         : undefined,
     },

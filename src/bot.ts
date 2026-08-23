@@ -28,6 +28,7 @@ import {
   isChatAllowed,
   isThanksMessage,
   LINK_MODERATION_MESSAGE,
+  MAIN_CHANNEL_USERNAME,
   normalizeTelegramUsername,
   parseBoolean,
   parseIdSet,
@@ -964,7 +965,19 @@ async function shouldDeleteDisallowedLink(
 }
 
 function canSendDisallowedLinks(message: Message, config: RuntimeConfig): boolean {
-  return isLinkAllowedUser(message.from, config);
+  return (
+    isAutomaticForwardFromMainChannel(message) ||
+    isLinkAllowedUser(message.from, config)
+  );
+}
+
+function isAutomaticForwardFromMainChannel(message: Message): boolean {
+  return (
+    message.is_automatic_forward === true &&
+    message.sender_chat?.type === "channel" &&
+    normalizeTelegramUsername(message.sender_chat.username) ===
+      MAIN_CHANNEL_USERNAME
+  );
 }
 
 function isLinkAllowedUser(

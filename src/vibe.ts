@@ -36,7 +36,7 @@ const THANKS_MESSAGE_PATTERN =
 
 const WORD_BOUNDARY = String.raw`(?:^|[^\p{Letter}\p{Number}_])`;
 const WORD_END_BOUNDARY = String.raw`(?=$|[^\p{Letter}\p{Number}_])`;
-const MAIN_CHANNEL_USERNAME = "sukharev_ii";
+export const MAIN_CHANNEL_USERNAME = "sukharev_ii";
 const BARE_MARKDOWN_FILE_REFERENCES = new Set([
   "agents.md",
   "claude.md",
