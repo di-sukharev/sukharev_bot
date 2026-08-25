@@ -521,7 +521,7 @@ describe("community bot", () => {
     });
   });
 
-  test("keeps allowed GitHub, YouTube, Instagram, and main channel Telegram link messages", async () => {
+  test("keeps messages with trusted-domain and main channel Telegram links", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const bot = createCommunityBot(createTestEnv(), {
       repository,
@@ -531,7 +531,7 @@ describe("community bot", () => {
     await bot.handleUpdate(
       linkMessageUpdate({
         text:
-          "repo https://github.com/openai/codex mirror github.com/openai/codex gist https://gist.github.com/user/id video https://youtu.be/dQw4w9WgXcQ music https://music.youtube.com/watch?v=dQw4w9WgXcQ insta https://www.instagram.com/p/C0ffeeCode/ пост https://t.me/sukharev_ii/123",
+          "repo https://github.com/openai/codex mirror github.com/openai/codex gist https://gist.github.com/user/id video https://youtu.be/dQw4w9WgXcQ music https://music.youtube.com/watch?v=dQw4w9WgXcQ insta https://www.instagram.com/p/C0ffeeCode/ сайт https://sukharev.dev/ уроки https://vibe.sukharev.dev/ пост https://t.me/sukharev_ii/123",
         links: [
           "https://github.com/openai/codex",
           "github.com/openai/codex",
@@ -539,6 +539,8 @@ describe("community bot", () => {
           "https://youtu.be/dQw4w9WgXcQ",
           "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
           "https://www.instagram.com/p/C0ffeeCode/",
+          "https://sukharev.dev/",
+          "https://vibe.sukharev.dev/",
           "https://t.me/sukharev_ii/123",
         ],
       }),

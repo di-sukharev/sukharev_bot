@@ -57,7 +57,7 @@ describe("vibe rules", () => {
     expect(rules.text).toContain(`- ${LINK_MODERATION_MESSAGE}`);
   });
 
-  test("allows GitHub, YouTube, Instagram, and main channel Telegram link entities", () => {
+  test("allows trusted domains and main channel Telegram link entities", () => {
     expect(
       hasDisallowedTelegramLink(urlLinkCarrier("https://github.com/openai/codex")),
     ).toBe(false);
@@ -89,6 +89,15 @@ describe("vibe rules", () => {
       hasDisallowedTelegramLink(urlLinkCarrier("instagram.com/reel/C0ffeeCode/")),
     ).toBe(false);
     expect(
+      hasDisallowedTelegramLink(urlLinkCarrier("https://sukharev.dev/")),
+    ).toBe(false);
+    expect(
+      hasDisallowedTelegramLink(urlLinkCarrier("vibe.sukharev.dev/")),
+    ).toBe(false);
+    expect(
+      hasDisallowedTelegramLink(urlLinkCarrier("https://docs.sukharev.dev/guide")),
+    ).toBe(false);
+    expect(
       hasDisallowedTelegramLink(urlLinkCarrier("https://t.me/sukharev_ii/123")),
     ).toBe(false);
     expect(
@@ -108,6 +117,9 @@ describe("vibe rules", () => {
       hasDisallowedTelegramLink(
         urlLinkCarrier("https://instagram.com.evil.com/p/C0ffeeCode/"),
       ),
+    ).toBe(true);
+    expect(
+      hasDisallowedTelegramLink(urlLinkCarrier("https://sukharev.dev.evil/")),
     ).toBe(true);
     expect(
       hasDisallowedTelegramLink(

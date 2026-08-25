@@ -199,6 +199,7 @@ function isAllowedTelegramLink(
     isAllowedGithubUrl(value) ||
     isAllowedYoutubeUrl(value) ||
     isAllowedInstagramUrl(value) ||
+    isAllowedSukharevUrl(value) ||
     isAllowedTelegramUserMentionUrl(value) ||
     isAllowedMainChannelTelegramUrl(value) ||
     isCurrentChatTelegramMessageUrl(value, chat) ||
@@ -249,6 +250,16 @@ function isAllowedInstagramUrl(value: string): boolean {
 
   const hostname = url.hostname.toLowerCase();
   return hostname === "instagram.com" || hostname.endsWith(".instagram.com");
+}
+
+function isAllowedSukharevUrl(value: string): boolean {
+  const url = parseTelegramUrl(value);
+  if (!url || (url.protocol !== "http:" && url.protocol !== "https:")) {
+    return false;
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  return hostname === "sukharev.dev" || hostname.endsWith(".sukharev.dev");
 }
 
 function isAllowedMainChannelTelegramUrl(value: string): boolean {
@@ -639,7 +650,7 @@ export type HtmlMessage = {
 };
 
 export const LINK_MODERATION_MESSAGE =
-  "ссылки отправлять нельзя, кроме GitHub, YouTube, Instagram, сообщений из этой группы и постов из канала @sukharev_ii; любые ссылки можно отправлять с 25 вайба. хорошие от плохих разделить сложно, поэтому до 25 вайба нельзя никакие другие. отправляйте ссылки друг другу в личку (пожалуйста, все будьте аккуратнее, открывая ссылки).";
+  "ссылки отправлять нельзя, кроме GitHub, YouTube, Instagram, sukharev.dev, сообщений из этой группы и постов из канала @sukharev_ii; любые ссылки можно отправлять с 25 вайба. хорошие от плохих разделить сложно, поэтому до 25 вайба нельзя никакие другие. отправляйте ссылки друг другу в личку (пожалуйста, все будьте аккуратнее, открывая ссылки).";
 
 const PROFANITY_MODERATION_REASON = "сквернословие запрещено 🐿️";
 
