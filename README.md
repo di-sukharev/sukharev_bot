@@ -13,14 +13,22 @@ The project is distributed under the [Apache License 2.0](LICENSE).
 - limits links to trusted domains, protected users, or members with enough vibe;
 - removes configured profanity and applies negative vibe;
 - awards and rolls back vibe for thanks replies and Telegram reactions;
-- deletes messages after repeated negative reactions and bans users below the
-  configured moderation threshold;
+- deletes messages with 3 or more active 💩/👎 reactions combined;
+- permanently bans users at −10 vibe or below and requests deletion of all their
+  messages in the same chat via Telegram's `revoke_messages` option;
 - provides `/chatid`, `/rules`, `/vibe`, and `/vibe_top` commands;
 - processes Telegram updates idempotently through D1 reservations.
 
 The bot is intentionally project-specific. Moderation thresholds, Russian copy,
 the profanity list, and the allowed main Telegram channel live in
 [`src/bot.ts`](src/bot.ts) and [`src/vibe.ts`](src/vibe.ts).
+
+Protected users in `OWNER_USER_IDS` are exempt from reaction-based deletion and
+low-vibe bans. Automatic bans also exempt `@haltmachina`, chat administrators,
+and the chat creator. Before banning, the bot checks the current Telegram role
+and only bans regular members or restricted users who are still members.
+Identifiable self-reactions do not count. Moderation runs when new
+updates arrive; existing messages and completed bans are not rescanned.
 
 ## Requirements
 

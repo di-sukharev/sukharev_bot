@@ -58,7 +58,7 @@ const VIBE_TOP_LIMIT = 10;
 const LINK_PERMISSION_VIBE_THRESHOLD = 25;
 const AGGREGATE_REACTION_ACTOR_ID = "__reaction_count__";
 const UNKNOWN_MESSAGE_AUTHOR_ID = "__unknown_message_author__";
-const NEGATIVE_DELETE_MESSAGE_THRESHOLD = 5;
+const NEGATIVE_DELETE_MESSAGE_THRESHOLD = 3;
 const LOW_VIBE_WARNING_THRESHOLD = -5;
 const LOW_VIBE_BAN_THRESHOLD = -10;
 
@@ -662,12 +662,26 @@ async function maybeBanForLowVibe(
   recipient: TelegramUserProfile,
   knownScore: number | null = null,
 ): Promise<void> {
-  if (recipient.isBot || ctx.config.ownerUserIds.has(recipient.id)) {
+  if (
+    recipient.isBot ||
+    ctx.config.ownerUserIds.has(recipient.id) ||
+    normalizeTelegramUsername(recipient.username) === "haltmachina"
+  ) {
     return;
   }
 
   const score = knownScore ?? await ctx.repository.getVibeScore(chatId, recipient.id);
   if (score <= LOW_VIBE_BAN_THRESHOLD) {
+    const member = await ctx.api.getChatMember(apiChatId, Number(recipient.id));
+    const isParticipant = member.status === "member" ||
+      (member.status === "restricted" && member.is_member);
+    if (
+      !isParticipant ||
+      normalizeTelegramUsername(member.user.username) === "haltmachina"
+    ) {
+      return;
+    }
+
     await runModerationAction(
       ctx,
       {
@@ -678,7 +692,9 @@ async function maybeBanForLowVibe(
         targetMessageId: null,
       },
       async () => {
-        await ctx.api.banChatMember(apiChatId, Number(recipient.id));
+        await ctx.api.banChatMember(apiChatId, Number(recipient.id), {
+          revoke_messages: true,
+        });
       },
     );
   }

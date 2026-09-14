@@ -101,6 +101,16 @@ export function installTelegramFetchMock() {
       const body = parseRequestBody(init?.body);
       requests.push({ url: String(input), body });
 
+      if (String(input).endsWith("/getChatMember")) {
+        return Response.json({
+          ok: true,
+          result: {
+            status: "member",
+            user: { id: (body as { user_id: number }).user_id, is_bot: false, first_name: "Member" },
+          },
+        });
+      }
+
       return Response.json({
         ok: true,
         result: {
