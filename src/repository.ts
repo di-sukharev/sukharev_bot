@@ -256,8 +256,8 @@ export function createD1CommunityBotRepository(
       const cutoff = new Date(Date.parse(timestamp) - NEGATIVE_REACTION_LIMIT_WINDOW_MS).toISOString();
       const chargeRequested = Number(requestNegativeCharge);
       const chargeBindings = [
-        chargeRequested, state.chatId, state.actorId,
-        state.recipientUserId, entry.idempotencyKey,
+        chargeRequested, entry.chatId, entry.actorUserId,
+        entry.recipientUserId, entry.idempotencyKey,
       ];
       const chargeSql = `CASE WHEN ? AND EXISTS (
         SELECT 1 FROM negative_reaction_limits
@@ -265,8 +265,8 @@ export function createD1CommunityBotRepository(
           AND idempotency_key = ?
       ) THEN 1 ELSE 0 END`;
 
-      // D1 claims the pair allowance, records the permanent charge, and updates
-      // the active reaction snapshot in one transaction across all messages.
+      // D1 claims the pair allowance and records the permanent charge atomically.
+      // Only current updates also replace the active reaction snapshot.
       const statements = [
         database.prepare(`
           INSERT INTO negative_reaction_limits
@@ -280,7 +280,7 @@ export function createD1CommunityBotRepository(
             idempotency_key = excluded.idempotency_key
           WHERE negative_reaction_limits.charged_at <= ?
         `).bind(
-          state.chatId, state.actorId, state.recipientUserId, timestamp,
+          entry.chatId, entry.actorUserId, entry.recipientUserId, timestamp,
           entry.idempotencyKey, chargeRequested, entry.idempotencyKey, cutoff,
         ),
         database.prepare(`
@@ -294,7 +294,9 @@ export function createD1CommunityBotRepository(
           entry.actorUserId, entry.delta, ...chargeBindings, entry.source,
           entry.reason, entry.sourceMessageId, entry.targetMessageId, timestamp,
         ),
-        database.prepare(`
+      ];
+      if (state) {
+        statements.push(database.prepare(`
           INSERT INTO reaction_vibe_states (
             chat_id, message_id, actor_id, recipient_user_id,
             positive_reaction_count, poop_reaction_count,
@@ -313,8 +315,8 @@ export function createD1CommunityBotRepository(
           state.chatId, state.messageId, state.actorId, state.recipientUserId,
           state.positiveReactionCount, state.negativeReactionCount,
           state.lastUpdateDate, state.lastUpdateId, timestamp,
-        ),
-      ];
+        ));
+      }
       const results = await database.batch<{ delta: number }>(statements);
       return {
         inserted: didChange(results[1]!),

@@ -88,7 +88,8 @@ export type ReactionVibeStateInput = {
 export type LimitedReactionVibeInput = {
   // The base delta contains only positive reaction changes.
   entry: VibeLedgerInput & { actorUserId: string };
-  state: ReactionVibeStateInput;
+  // Stale additions can charge permanently without replacing the active snapshot.
+  state: ReactionVibeStateInput | null;
   requestNegativeCharge: boolean;
 };
 

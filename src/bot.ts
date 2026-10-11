@@ -265,7 +265,15 @@ export function createCommunityBot(
         reactionUpdate.message_id,
         actorId,
       );
-      if (isStaleReactionUpdate(previousState, reactionUpdate.date, ctx.update.update_id)) {
+      const stale = isStaleReactionUpdate(previousState, reactionUpdate.date, ctx.update.update_id);
+      const nextState = {
+        positiveReactionCount: countPositiveReactions(reactionUpdate.new_reaction),
+        negativeReactionCount: countNegativeReactions(reactionUpdate.new_reaction),
+      };
+      // A newer snapshot supersedes active reactions, but cannot erase a genuine
+      // negative addition whose permanent charge has not been processed yet.
+      if (stale && (!vibeRecipient || recipient?.id === actorId ||
+        nextState.negativeReactionCount <= oldNegativeReactionCount)) {
         return;
       }
 
@@ -283,10 +291,6 @@ export function createCommunityBot(
         return;
       }
 
-      const nextState = {
-        positiveReactionCount: countPositiveReactions(reactionUpdate.new_reaction),
-        negativeReactionCount: countNegativeReactions(reactionUpdate.new_reaction),
-      };
       const deltas = getReactionStateDeltas(previousState, nextState);
       let vibeDelta = getRecipientVibeDelta(
         previousState,
@@ -322,15 +326,15 @@ export function createCommunityBot(
             chatId,
             recipientUserId: vibeRecipient.id,
             actorUserId: actorId,
-            delta: nextState.positiveReactionCount -
+            delta: stale ? 0 : nextState.positiveReactionCount -
               (sameRecipient ? previousState.positiveReactionCount : 0),
             source: "message_reaction",
             reason: "reaction vibe delta",
             sourceMessageId: null,
             targetMessageId: reactionUpdate.message_id,
           },
-          state,
-          requestNegativeCharge: nextState.negativeReactionCount >
+          state: stale ? null : state,
+          requestNegativeCharge: stale || nextState.negativeReactionCount >
             (sameRecipient ? Math.min(previousState.negativeReactionCount,
               oldNegativeReactionCount) : 0),
         });
@@ -362,7 +366,7 @@ export function createCommunityBot(
         inserted &&
         vibeRecipient &&
         (vibeDelta > 0 || allowNegativeAnnouncement) &&
-        shouldAnnounceReactionDelta(ctx.config, deltas, vibeDelta)
+        (stale ? ctx.config.announceReactions : shouldAnnounceReactionDelta(ctx.config, deltas, vibeDelta))
       ) {
         await sendVibeNotification(
           ctx,
@@ -373,7 +377,7 @@ export function createCommunityBot(
         );
       }
 
-      if (nextState.negativeReactionCount > 0) {
+      if (!stale && nextState.negativeReactionCount > 0) {
         await maybeDeleteNegativeModeratedMessage(
           ctx,
           reactionUpdate.chat.id,

@@ -40,6 +40,9 @@ window. Denied negative reactions send no notification. Positive reaction
 awards and rollbacks retain their existing behavior.
 The allowance is checked when the update is processed. It does not
 automatically charge reactions that remain active when the window expires.
+Delayed negative additions still use this allowance even if a newer removal or
+switch was processed first. They do not replace the latest active reaction state
+or change positive reaction scoring.
 Existing charges retain their timestamps when deploying a new window duration.
 All active negative reactions still count toward message deletion, including
 reactions that did not deduct vibe. Anonymous aggregate reaction counts have

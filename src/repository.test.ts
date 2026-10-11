@@ -8,6 +8,7 @@ import type {
   CommunityBotRepository,
   LimitedReactionVibeInput,
   ModerationActionInput,
+  ReactionVibeStateInput,
 } from "./types";
 
 let miniflare: Miniflare;
@@ -30,6 +31,95 @@ beforeAll(async () => {
 });
 
 describe("D1 negative reaction limits", () => {
+  test.each([
+    { actorId: 70, newestFirst: false, terminalEmoji: null },
+    { actorId: 71, newestFirst: true, terminalEmoji: null },
+    { actorId: 72, newestFirst: false, terminalEmoji: "👍" },
+    { actorId: 73, newestFirst: true, terminalEmoji: "👍" },
+    { actorId: 74, newestFirst: false, terminalEmoji: "💩" },
+    { actorId: 75, newestFirst: true, terminalEmoji: "💩" },
+  ] as const)("charges the first negative independently of snapshot order: %j", async ({ actorId, newestFirst, terminalEmoji }) => {
+    const messageId = actorId * 100;
+    const telegram = installTelegramFetchMock();
+    const bot = createCommunityBot(createTestEnv("-1001", { ANNOUNCE_REACTIONS: "true" }),
+      { repository, apiFetch: telegram.fetch });
+    try {
+      await bot.handleUpdate(storedMessageUpdate(messageId, messageId, messageId));
+      const add = negativeReactionUpdate(messageId + 1, messageId, { actorId });
+      const terminal = negativeReactionUpdate(messageId + 2, messageId, {
+        actorId, oldEmojis: ["👎"], newEmojis: terminalEmoji ? [terminalEmoji] : [],
+      });
+      const updates = newestFirst ? [terminal, add] : [add, terminal];
+      for (const update of [...updates, ...updates]) await bot.handleUpdate(update);
+
+      expect(await repository.getVibeScore("-1001", String(messageId)))
+        .toBe(terminalEmoji === "👍" ? 0 : -1);
+      expect(await repository.getReactionVibeState("-1001", messageId, String(actorId)))
+        .toMatchObject({
+          positiveReactionCount: Number(terminalEmoji === "👍"),
+          negativeReactionCount: Number(terminalEmoji === "💩"),
+          lastUpdateId: messageId + 2,
+        });
+      expect(await database.prepare(
+        "SELECT COUNT(*) AS count FROM negative_reaction_limits WHERE actor_id = ? AND recipient_user_id = ?",
+      ).bind(String(actorId), String(messageId)).first<number>("count")).toBe(1);
+      expect(telegram.requests.filter(request => request.url.endsWith("/sendMessage") &&
+        (request.body as { text: string }).text.includes("минус"))).toHaveLength(1);
+      expect(telegram.requests.filter(request => request.url.endsWith("/deleteMessage"))).toHaveLength(0);
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test.each([false, true])("bans at the permanent balance after first add/removal, newest first: %s", async newestFirst => {
+    const actorId = newestFirst ? 77 : 76;
+    const messageId = actorId * 100;
+    const telegram = installTelegramFetchMock();
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
+    try {
+      await bot.handleUpdate(storedMessageUpdate(messageId, messageId, messageId));
+      await repository.addVibeLedgerEntry({
+        ...limitedReactionInput(String(actorId), messageId).entry,
+        idempotencyKey: `seed:${messageId}`, recipientUserId: String(messageId), delta: -9,
+      });
+      const add = negativeReactionUpdate(messageId + 1, messageId, { actorId });
+      const remove = negativeReactionUpdate(messageId + 2, messageId, { actorId, remove: true });
+      const updates = newestFirst ? [remove, add] : [add, remove];
+      for (const update of [...updates, ...updates]) await bot.handleUpdate(update);
+
+      expect(await repository.getVibeScore("-1001", String(messageId))).toBe(-10);
+      expect(telegram.requests.filter(request => request.url.endsWith("/banChatMember"))).toHaveLength(1);
+      expect(telegram.requests.filter(request => request.url.endsWith("/deleteMessage"))).toHaveLength(0);
+      expect(await repository.getReactionVibeState("-1001", messageId, String(actorId)))
+        .toMatchObject({ negativeReactionCount: 0, lastUpdateId: messageId + 2 });
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test.each(["self", "bot", "unknown"] as const)("does not charge stale negative additions for %s authors", async protection => {
+    const actorId = protection === "self" ? 78 : protection === "bot" ? 79 : 80;
+    const messageId = actorId * 100;
+    const telegram = installTelegramFetchMock();
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
+    try {
+      if (protection !== "unknown") {
+        const message = storedMessageUpdate(messageId, messageId, protection === "self" ? actorId : messageId);
+        if (protection === "bot") message.message!.from!.is_bot = true;
+        await bot.handleUpdate(message);
+      }
+      await bot.handleUpdate(negativeReactionUpdate(messageId + 2, messageId, { actorId, remove: true }));
+      await bot.handleUpdate(negativeReactionUpdate(messageId + 1, messageId, { actorId }));
+      expect(await database.prepare(
+        "SELECT COUNT(*) AS count FROM vibe_ledger WHERE actor_user_id = ?",
+      ).bind(String(actorId)).first<number>("count")).toBe(0);
+      expect(await repository.getReactionVibeState("-1001", messageId, String(actorId)))
+        .toMatchObject({ negativeReactionCount: 0, lastUpdateId: messageId + 2 });
+    } finally {
+      telegram.restore();
+    }
+  });
+
   test("keeps positive scoring and the permanent charge across out-of-order snapshots", async () => {
     const telegram = installTelegramFetchMock();
     const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
@@ -361,7 +451,7 @@ async function applyMigration(db: D1Database, filename: string) {
   }
 }
 
-function limitedReactionInput(actorId: string, messageId: number): LimitedReactionVibeInput {
+function limitedReactionInput(actorId: string, messageId: number): LimitedReactionVibeInput & { state: ReactionVibeStateInput } {
   return {
     entry: {
       idempotencyKey: `${actorId}:${messageId}`,

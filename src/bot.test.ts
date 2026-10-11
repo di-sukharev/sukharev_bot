@@ -1342,7 +1342,7 @@ describe("community bot", () => {
     });
   });
 
-  test("ignores a stale per-user reaction snapshot delivered out of order", async () => {
+  test("preserves the latest snapshot while charging a stale negative addition", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const bot = createCommunityBot(createTestEnv(), {
       repository,
@@ -1362,7 +1362,7 @@ describe("community bot", () => {
       negativeReactionCount: 0,
       lastUpdateId: 101,
     });
-    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
   });
 
   test.each(["💩", "👎", "mixed"] as const)(

@@ -246,8 +246,7 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
     if (this.ledger.has(entry.idempotencyKey)) {
       return { inserted: false, delta: 0, negativeChargeApplied: false };
     }
-    const stateKey = reactionAwardKey(state.chatId, state.messageId, state.actorId);
-    const key = `${state.chatId}:${state.actorId}:${state.recipientUserId}`;
+    const key = `${entry.chatId}:${entry.actorUserId}:${entry.recipientUserId}`;
     const now = Date.now();
     const lastCharge = this.negativeReactionLimits.get(key);
     const charge = Number(requestNegativeCharge &&
@@ -257,7 +256,10 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
     }
     const delta = entry.delta - charge;
     this.ledger.set(entry.idempotencyKey, { ...entry, delta });
-    this.reactionStates.set(stateKey, state);
+    if (state) {
+      const stateKey = reactionAwardKey(state.chatId, state.messageId, state.actorId);
+      this.reactionStates.set(stateKey, state);
+    }
     return { inserted: true, delta, negativeChargeApplied: charge > 0 };
   }
 
