@@ -1,4 +1,4 @@
-import { Bot, Context } from "grammy";
+import { Bot, Context, GrammyError } from "grammy";
 import type { Chat, Message, Update, User, UserFromGetMe } from "grammy/types";
 import { createD1CommunityBotRepository } from "./repository";
 import type {
@@ -367,21 +367,13 @@ export function createCommunityBot(
         (vibeDelta > 0 || allowNegativeAnnouncement) &&
         shouldAnnounceReactionDelta(ctx.config, deltas, vibeDelta)
       ) {
-        const sentMessage = await ctx.api.sendMessage(
+        await sendVibeNotification(
+          ctx,
           reactionUpdate.chat.id,
+          vibeRecipient,
           buildReactionVibeMessage(ctx, vibeDelta, vibeRecipient, currentScore),
-          replyToMessage(reactionUpdate.message_id),
+          reactionUpdate.message_id,
         );
-        if (vibeDelta > 0) {
-          await scheduleVibeNotificationDelete(
-            env,
-            {
-              chatId: reactionUpdate.chat.id,
-              messageId: sentMessage.message_id,
-            },
-            ctx.notificationDelete,
-          );
-        }
       }
 
       if (nextState.negativeReactionCount > 0) {
@@ -481,21 +473,13 @@ export function createCommunityBot(
         vibeRecipient &&
         shouldAnnounceReactionDelta(ctx.config, deltas, vibeDelta)
       ) {
-        const sentMessage = await ctx.api.sendMessage(
+        await sendVibeNotification(
+          ctx,
           reactionUpdate.chat.id,
+          vibeRecipient,
           buildReactionVibeMessage(ctx, vibeDelta, vibeRecipient, currentScore),
-          replyToMessage(reactionUpdate.message_id),
+          reactionUpdate.message_id,
         );
-        if (vibeDelta > 0) {
-          await scheduleVibeNotificationDelete(
-            env,
-            {
-              chatId: reactionUpdate.chat.id,
-              messageId: sentMessage.message_id,
-            },
-            ctx.notificationDelete,
-          );
-        }
       }
 
       if (nextState.negativeReactionCount > 0) {
@@ -525,7 +509,7 @@ export function createCommunityBot(
     const message = ctx.message;
     await storeReactionModeratedMessage(ctx, message);
 
-    await maybeAwardThanksReply(ctx, message, env);
+    await maybeAwardThanksReply(ctx, message);
   });
 
   bot.on("edited_message", async (ctx) => {
@@ -779,7 +763,7 @@ async function deleteProfanityMessage(
       await deleteModeratedMessage(ctx, message.chat.id, message.message_id);
     },
   );
-  await sendModerationWarning(
+  await runModerationAction(
     ctx,
     {
       idempotencyKey: `send_warning:profanity:${chatId}:${message.message_id}`,
@@ -788,8 +772,15 @@ async function deleteProfanityMessage(
       targetUserId: author.id,
       targetMessageId: message.message_id,
     },
-    message.chat.id,
-    buildProfanityModerationWarning(ctx, message, author, currentScore),
+    async () => {
+      // The original message was deleted, so the private warning has no reply target.
+      await sendVibeNotification(
+        ctx,
+        message.chat.id,
+        author,
+        buildProfanityModerationWarning(ctx, message, author, currentScore),
+      );
+    },
   );
 
   await maybeBanForLowVibe(ctx, message.chat.id, chatId, author, currentScore);
@@ -857,11 +848,33 @@ function formatNegativeVibeDelta(delta: number, currentScore: number | null): st
   return `минус ${amount} ${vibeWord}${formatVibeScoreParenthetical(currentScore)}`;
 }
 
-function replyToMessage(messageId: number) {
-  return {
-    reply_to_message_id: messageId,
-    allow_sending_without_reply: true,
+async function sendVibeNotification(
+  ctx: CommunityBotContext,
+  chatId: number | string,
+  recipient: TelegramUserProfile,
+  text: string,
+  replyMessageId?: number,
+): Promise<void> {
+  // grammY's installed types predate ephemeral_message_parameters (Bot API 10.3).
+  // Its client serializes these fields without requiring a dependency update.
+  const options = {
+    ephemeral_message_parameters: { receiver_user_id: Number(recipient.id) },
+    disable_notification: true,
+    ...(replyMessageId === undefined
+      ? {}
+      : { reply_parameters: { message_id: replyMessageId } }),
   };
+
+  try {
+    await ctx.api.sendMessage(chatId, text, options);
+  } catch (error) {
+    // Ephemeral delivery is best effort. Never retry as a public message or
+    // interrupt score accounting, message deletion, or low-vibe bans.
+    console.error("Private vibe notification failed", {
+      errorType: error instanceof GrammyError ? "telegram_api" : "transport",
+      errorCode: error instanceof GrammyError ? error.error_code : undefined,
+    });
+  }
 }
 
 function getMessageText(message: Message): string | null {
@@ -1234,7 +1247,6 @@ export function parseBotInfo(value: string | undefined): UserFromGetMe {
 async function maybeAwardThanksReply(
   ctx: CommunityBotContext,
   message: Message,
-  env: WorkerEnv,
 ): Promise<void> {
   if (!message.from || message.from.is_bot || !message.reply_to_message) {
     return;
@@ -1269,17 +1281,12 @@ async function maybeAwardThanksReply(
 
   if (inserted) {
     const currentScore = await ctx.repository.getVibeScore(chatId, recipient.id);
-    const sentMessage = await ctx.reply(
+    await sendVibeNotification(
+      ctx,
+      message.chat.id,
+      recipient,
       buildAwardMessage(1, recipient.displayName, currentScore),
-      replyToMessage(message.reply_to_message.message_id),
-    );
-    await scheduleVibeNotificationDelete(
-      env,
-      {
-        chatId: message.chat.id,
-        messageId: sentMessage.message_id,
-      },
-      ctx.notificationDelete,
+      message.reply_to_message.message_id,
     );
   }
 }

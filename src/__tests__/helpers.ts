@@ -112,6 +112,22 @@ export function installTelegramFetchMock() {
         });
       }
 
+      const receiverUserId = (body as {
+        ephemeral_message_parameters?: { receiver_user_id: number };
+      })?.ephemeral_message_parameters?.receiver_user_id;
+      if (String(input).endsWith("/sendMessage") && receiverUserId !== undefined) {
+        return Response.json({
+          ok: true,
+          result: {
+            message_id: 0,
+            ephemeral_message_id: requests.length,
+            receiver_user: { id: receiverUserId, is_bot: false, first_name: "Recipient" },
+            date: 1,
+            chat: { id: -1001, type: "supergroup", title: "Students" },
+          },
+        });
+      }
+
       return Response.json({
         ok: true,
         result: {

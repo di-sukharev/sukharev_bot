@@ -42,6 +42,18 @@ All active negative reactions still count toward message deletion, including
 reactions that did not deduct vibe. Anonymous aggregate reaction counts have
 no actor identity and retain their existing scoring and announcement behavior.
 
+Automatic vibe notifications for thanks, reactions (including anonymous
+aggregate counts), and profanity penalties are sent silently as
+[ephemeral messages](https://core.telegram.org/bots/api#ephemeral-messages-and-commands).
+Only the recipient and the bot can see them inside the group. They are not
+queued for deletion. Telegram may discard them while the recipient is offline,
+and clients may remove them over time or after restarting. Scores remain in D1.
+Notification failures are logged without publishing a public fallback and do not
+interrupt message deletion or low-vibe bans. `disable_notification` prevents
+sound; it does not guarantee that the client shows no notification.
+Command replies and link moderation warnings retain their existing visibility.
+Welcome messages remain public and are deleted after 15 seconds.
+
 ## Requirements
 
 - [Bun](https://bun.sh/) 1.3.11 or newer;
@@ -133,6 +145,8 @@ Add the bot to the group as an administrator. Reading messages, member updates,
 and reactions is required for normal operation. Link and profanity moderation
 requires `can_delete_messages`; automatic low-vibe bans require
 `can_restrict_members`.
+Administrator status also allows the bot to send ephemeral vibe notifications
+directly to any non-bot member without a callback or prior private conversation.
 
 After deployment, use `/chatid` to discover the target chat ID. Add it to
 `ALLOWED_CHAT_IDS`, redeploy, then set the webhook:

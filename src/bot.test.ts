@@ -733,12 +733,13 @@ describe("community bot", () => {
     expect(await repository.getVibeScore("-1001", "10")).toBe(1);
     expect(fetchMock.requests.at(-1)?.body).toMatchObject({
       text: "Кирилл, вам +1 вайб (1 вайба)",
-      reply_to_message_id: 100,
-      allow_sending_without_reply: true,
+      disable_notification: true,
+      ephemeral_message_parameters: { receiver_user_id: 10 },
+      reply_parameters: { message_id: 100 },
     });
   });
 
-  test("queues positive thanks announcement for deletion after five seconds", async () => {
+  test("does not queue private thanks announcements for deletion", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const queueMock = createQueueMock<VibeNotificationDeleteJob>();
     const bot = createCommunityBot(
@@ -754,15 +755,10 @@ describe("community bot", () => {
     await bot.handleUpdate(questionMessageUpdate());
     await bot.handleUpdate(thanksReplyUpdate());
 
-    expect(queueMock.messages).toEqual([
-      {
-        message: { chatId: -1001, messageId: 1 },
-        options: { delaySeconds: 5 },
-      },
-    ]);
+    expect(queueMock.messages).toEqual([]);
   });
 
-  test("uses a background task for positive thanks announcement deletion when available", async () => {
+  test("does not schedule private thanks announcements for background deletion", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const queueMock = createQueueMock<VibeNotificationDeleteJob>();
     const scheduledTasks: Array<Promise<void>> = [];
@@ -784,16 +780,12 @@ describe("community bot", () => {
     await bot.handleUpdate(questionMessageUpdate());
     await bot.handleUpdate(thanksReplyUpdate());
 
-    expect(scheduledTasks).toHaveLength(1);
+    expect(scheduledTasks).toHaveLength(0);
     expect(queueMock.messages).toEqual([]);
 
     await Promise.all(scheduledTasks);
 
-    expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
-    expect(telegramMethodRequests("deleteMessage")[0]?.body).toMatchObject({
-      chat_id: -1001,
-      message_id: 1,
-    });
+    expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
   });
 
   test("ignores self-thanks", async () => {
@@ -829,7 +821,7 @@ describe("community bot", () => {
     expect(await repository.getVibeScore("-1001", "10")).toBe(0);
   });
 
-  test("queues positive reaction announcement for deletion after five seconds", async () => {
+  test("sends positive reaction announcements privately without deletion", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const queueMock = createQueueMock<VibeNotificationDeleteJob>();
     const bot = createCommunityBot(
@@ -848,15 +840,11 @@ describe("community bot", () => {
 
     expect(telegramMethodRequests("sendMessage").at(-1)?.body).toMatchObject({
       text: "Кирилл, вам +1 вайб (1 вайба)",
-      reply_to_message_id: 100,
-      allow_sending_without_reply: true,
+      disable_notification: true,
+      ephemeral_message_parameters: { receiver_user_id: 10 },
+      reply_parameters: { message_id: 100 },
     });
-    expect(queueMock.messages).toEqual([
-      {
-        message: { chatId: -1001, messageId: 1 },
-        options: { delaySeconds: 5 },
-      },
-    ]);
+    expect(queueMock.messages).toEqual([]);
   });
 
   test("awards reaction vibe from actor chat", async () => {
@@ -898,6 +886,136 @@ describe("community bot", () => {
     expect(await repository.getVibeScore("-1001", "10")).toBe(1);
   });
 
+  test("sends aggregate positive announcements privately without cleanup", async () => {
+    const repository = new InMemoryCommunityBotRepository();
+    const queueMock = createQueueMock<VibeNotificationDeleteJob>();
+    const scheduledTasks: Array<Promise<void>> = [];
+    const bot = createCommunityBot(
+      createTestEnv("-1001", {
+        ANNOUNCE_REACTIONS: "true",
+        VIBE_NOTIFICATION_DELETE_QUEUE: queueMock.queue,
+      }),
+      {
+        repository,
+        apiFetch: fetchMock.fetch,
+        notificationDelete: { scheduleTask: task => scheduledTasks.push(task) },
+      },
+    );
+
+    await bot.handleUpdate(questionMessageUpdate());
+    await bot.handleUpdate(reactionCountUpdate(3, [
+      { type: emojiReaction("👍"), total_count: 2 },
+    ]));
+
+    expect(await repository.getVibeScore("-1001", "10")).toBe(2);
+    expect(telegramMethodRequests("sendMessage")[0]?.body).toMatchObject({
+      chat_id: -1001,
+      disable_notification: true,
+      ephemeral_message_parameters: { receiver_user_id: 10 },
+      reply_parameters: { message_id: 100 },
+    });
+    expect(queueMock.messages).toEqual([]);
+    expect(scheduledTasks).toHaveLength(0);
+  });
+
+  test.each(["api", "transport"] as const)(
+    "preserves thanks awards without public fallback after a notification %s failure",
+    async (failure) => {
+      const repository = new InMemoryCommunityBotRepository();
+      const attempts: Array<Record<string, unknown>> = [];
+      const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
+      const bot = createCommunityBot(createTestEnv(), {
+        repository,
+        apiFetch: (async (_input, init) => {
+          attempts.push(JSON.parse(String(init?.body)));
+          if (failure === "transport") throw new Error("network unavailable");
+          return Response.json({
+            ok: false, error_code: 400, description: "ephemeral delivery unavailable",
+          });
+        }) as typeof fetch,
+      });
+
+      try {
+        await bot.handleUpdate(questionMessageUpdate());
+        const update = thanksReplyUpdate();
+        await bot.handleUpdate(update);
+        await bot.handleUpdate(update);
+
+        expect(await repository.getVibeScore("-1001", "10")).toBe(1);
+        expect(repository.processedUpdates.has(update.update_id)).toBe(true);
+        expect(attempts).toHaveLength(1);
+        expect(attempts[0]).toMatchObject({
+          disable_notification: true,
+          ephemeral_message_parameters: { receiver_user_id: 10 },
+        });
+        expect(errorLog).toHaveBeenCalledTimes(1);
+      } finally {
+        errorLog.mockRestore();
+      }
+    },
+  );
+
+  test.each(["individual", "aggregate", "profanity"] as const)(
+    "continues deletion and low-vibe bans after a private %s notification fails",
+    async (source) => {
+      const repository = new InMemoryCommunityBotRepository();
+      let failNotifications = false;
+      let failedAttempts = 0;
+      const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
+      const bot = createCommunityBot(
+        createTestEnv("-1001", { ANNOUNCE_REACTIONS: "true" }),
+        {
+          repository,
+          profanityWords: ["badword"],
+          apiFetch: (async (input, init) => {
+            if (failNotifications && String(input).endsWith("/sendMessage")) {
+              failedAttempts += 1;
+              return Response.json({
+                ok: false, error_code: 403, description: "ephemeral delivery forbidden",
+              });
+            }
+            return fetchMock.fetch(input, init);
+          }) as typeof fetch,
+        },
+      );
+
+      try {
+        await bot.handleUpdate(questionMessageUpdate());
+        if (source === "individual") {
+          await bot.handleUpdate(reactionUpdate(2, [], [emojiReaction("👎")], { actorId: 20 }));
+          await bot.handleUpdate(reactionUpdate(3, [], [emojiReaction("👎")], { actorId: 21 }));
+        }
+        await repository.addVibeLedgerEntry({
+          idempotencyKey: "seed:private-failure",
+          chatId: "-1001", recipientUserId: "10", actorUserId: null,
+          delta: source === "individual" ? -7 : -9,
+          source: "message_reaction", reason: "test seed",
+          sourceMessageId: null, targetMessageId: 100,
+        });
+        fetchMock.requests.length = 0;
+        failNotifications = true;
+        const update = source === "individual"
+          ? reactionUpdate(4, [], [emojiReaction("👎")], { actorId: 22 })
+          : source === "aggregate"
+          ? reactionCountUpdate(4, [{ type: emojiReaction("👎"), total_count: 3 }])
+          : questionMessageUpdate({ updateId: 4, messageId: 101, text: "badword" });
+
+        await bot.handleUpdate(update);
+        await bot.handleUpdate(update);
+
+        expect(await repository.getVibeScore("-1001", "10")).toBe(source === "aggregate" ? -12 : -10);
+        expect(repository.processedUpdates.has(update.update_id)).toBe(true);
+        expect(failedAttempts).toBe(1);
+        expect(telegramMethodRequests("sendMessage")).toHaveLength(0);
+        expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
+        expect(telegramMethodRequests("banChatMember")).toHaveLength(1);
+        expect(errorLog).toHaveBeenCalledTimes(1);
+      } finally {
+        errorLog.mockRestore();
+      }
+    },
+  );
+
   test("subtracts and rolls back poop reaction vibe", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const queueMock = createQueueMock<VibeNotificationDeleteJob>();
@@ -918,8 +1036,9 @@ describe("community bot", () => {
     expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
     expect(telegramMethodRequests("sendMessage").at(-1)?.body).toMatchObject({
       text: "Кирилл, минус 1 вайб (-1 вайба)",
-      reply_to_message_id: 100,
-      allow_sending_without_reply: true,
+      disable_notification: true,
+      ephemeral_message_parameters: { receiver_user_id: 10 },
+      reply_parameters: { message_id: 100 },
     });
     expect(queueMock.messages).toEqual([]);
 
@@ -946,8 +1065,9 @@ describe("community bot", () => {
     expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
     expect(telegramMethodRequests("sendMessage").at(-1)?.body).toMatchObject({
       text: "Кирилл, минус 1 вайб (-1 вайба)",
-      reply_to_message_id: 100,
-      allow_sending_without_reply: true,
+      disable_notification: true,
+      ephemeral_message_parameters: { receiver_user_id: 10 },
+      reply_parameters: { message_id: 100 },
     });
 
     await bot.handleUpdate(reactionUpdate(4, [emojiReaction("👎")], []));
@@ -1592,8 +1712,9 @@ describe("community bot", () => {
     expect(telegramMethodRequests("sendMessage").at(-1)?.body).toMatchObject({
       text:
         "Кирилл, минус 10 вайба (-10 вайба). у вас уже -10 вайба, при -10 я запрограммирована кикать из чата 🥊",
-      reply_to_message_id: 100,
-      allow_sending_without_reply: true,
+      disable_notification: true,
+      ephemeral_message_parameters: { receiver_user_id: 10 },
+      reply_parameters: { message_id: 100 },
     });
     expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
     expect(telegramMethodRequests("banChatMember")).toHaveLength(1);
@@ -1716,7 +1837,10 @@ describe("community bot", () => {
     expect(telegramMethodRequests("sendMessage").at(-1)?.body).toMatchObject({
       chat_id: -1001,
       text: "@kirill, минус 1 вайб (-1 вайба): сквернословие запрещено 🐿️",
+      disable_notification: true,
+      ephemeral_message_parameters: { receiver_user_id: 10 },
     });
+    expect(telegramMethodRequests("sendMessage").at(-1)?.body).not.toHaveProperty("reply_parameters");
     expect(queueMock.messages).toEqual([]);
   });
 
