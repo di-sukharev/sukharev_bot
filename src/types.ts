@@ -70,7 +70,6 @@ export type ReactionVibeState = {
   recipientUserId: string | null;
   positiveReactionCount: number;
   negativeReactionCount: number;
-  chargedNegativeReactionCount: number;
   lastUpdateDate: number | null;
   lastUpdateId: number | null;
 };
@@ -90,10 +89,7 @@ export type LimitedReactionVibeInput = {
   // The base delta contains only positive reaction changes.
   entry: VibeLedgerInput & { actorUserId: string };
   state: ReactionVibeStateInput;
-  oldNegativeReactionCount: number;
   requestNegativeCharge: boolean;
-  // Stale snapshots can refund earlier charges without replacing the latest state.
-  writeState: boolean;
 };
 
 export type ReservedUpdateProcessing = {

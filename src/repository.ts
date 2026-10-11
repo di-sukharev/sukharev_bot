@@ -12,7 +12,6 @@ import type {
 } from "./types";
 import {
   moderationActions,
-  negativeReactionCharges,
   reactionAwardReservations,
   processedUpdates,
   reactionVibeStates,
@@ -252,40 +251,9 @@ export function createD1CommunityBotRepository(
       return didChange(result);
     },
 
-    async applyLimitedReactionVibe({ entry, state, oldNegativeReactionCount, requestNegativeCharge, writeState }) {
+    async applyLimitedReactionVibe({ entry, state, requestNegativeCharge }) {
       const timestamp = nowIso();
       const cutoff = new Date(Date.parse(timestamp) - NEGATIVE_REACTION_LIMIT_WINDOW_MS).toISOString();
-      const charges = await db.select().from(negativeReactionCharges).where(and(
-        eq(negativeReactionCharges.chatId, state.chatId),
-        eq(negativeReactionCharges.messageId, state.messageId),
-        eq(negativeReactionCharges.actorId, state.actorId),
-      ));
-      charges.sort((a, b) => a.updateDate - b.updateDate || a.updateId - b.updateId);
-      // Both sides of the incoming event bound earlier refundable charges.
-      // Retain the newest eligible charges first. Repeated or stale bounds are
-      // then idempotent, and charges originating after this event survive.
-      let capacity = Math.min(oldNegativeReactionCount, state.negativeReactionCount);
-      const plans = charges.map(charge => ({ ...charge, retained: charge.amount }));
-      for (const plan of [...plans].reverse()) {
-        if (plan.updateDate < state.lastUpdateDate ||
-          (plan.updateDate === state.lastUpdateDate && plan.updateId < state.lastUpdateId)) {
-          plan.retained = Math.min(plan.amount, capacity);
-          capacity -= plan.retained;
-        }
-      }
-      const refunds = plans.filter(plan => plan.retained < plan.amount);
-      const refundBindings = refunds.flatMap(plan => [plan.idempotencyKey, plan.retained]);
-      const refundSql = refunds.length === 0 ? "0" : `COALESCE((
-        SELECT SUM(MAX(0, amount - CASE idempotency_key
-          ${refunds.map(() => "WHEN ? THEN ?").join(" ")} END))
-        FROM negative_reaction_charges
-        WHERE chat_id = ? AND message_id = ? AND actor_id = ?
-          AND idempotency_key IN (${refunds.map(() => "?").join(", ")})
-      ), 0)`;
-      if (refunds.length > 0) {
-        refundBindings.push(state.chatId, state.messageId, state.actorId,
-          ...refunds.map(plan => plan.idempotencyKey));
-      }
       const chargeRequested = Number(requestNegativeCharge);
       const chargeBindings = [
         chargeRequested, state.chatId, state.actorId,
@@ -297,8 +265,8 @@ export function createD1CommunityBotRepository(
           AND idempotency_key = ?
       ) THEN 1 ELSE 0 END`;
 
-      // The per-message reservation protects the refund plan. D1 applies the
-      // pair claim, actual refund amounts, ledger, and charge origins atomically.
+      // D1 claims the pair allowance, records the permanent charge, and updates
+      // the active reaction snapshot in one transaction across all messages.
       const statements = [
         database.prepare(`
           INSERT INTO negative_reaction_limits
@@ -319,30 +287,14 @@ export function createD1CommunityBotRepository(
           INSERT OR IGNORE INTO vibe_ledger (
             idempotency_key, chat_id, recipient_user_id, actor_user_id, delta,
             source, reason, source_message_id, target_message_id, created_at
-          ) VALUES (?, ?, ?, ?, ? + ${refundSql} - ${chargeSql}, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ? - ${chargeSql}, ?, ?, ?, ?, ?)
           RETURNING delta
         `).bind(
           entry.idempotencyKey, entry.chatId, entry.recipientUserId,
-          entry.actorUserId, entry.delta, ...refundBindings, ...chargeBindings, entry.source,
+          entry.actorUserId, entry.delta, ...chargeBindings, entry.source,
           entry.reason, entry.sourceMessageId, entry.targetMessageId, timestamp,
         ),
-        ...refunds.map(plan => database.prepare(`
-          UPDATE negative_reaction_charges SET amount = MIN(amount, ?)
-          WHERE chat_id = ? AND message_id = ? AND actor_id = ? AND idempotency_key = ?
-        `).bind(plan.retained, state.chatId, state.messageId, state.actorId, plan.idempotencyKey)),
         database.prepare(`
-          DELETE FROM negative_reaction_charges
-          WHERE chat_id = ? AND message_id = ? AND actor_id = ? AND amount = 0
-        `).bind(state.chatId, state.messageId, state.actorId),
-        database.prepare(`
-          INSERT OR IGNORE INTO negative_reaction_charges (
-            chat_id, message_id, actor_id, idempotency_key, amount, update_date, update_id
-          ) SELECT ?, ?, ?, ?, 1, ?, ? WHERE ${chargeSql}
-        `).bind(state.chatId, state.messageId, state.actorId, entry.idempotencyKey,
-          state.lastUpdateDate, state.lastUpdateId, ...chargeBindings),
-      ];
-      if (writeState) {
-        statements.push(database.prepare(`
           INSERT INTO reaction_vibe_states (
             chat_id, message_id, actor_id, recipient_user_id,
             positive_reaction_count, poop_reaction_count,
@@ -361,8 +313,8 @@ export function createD1CommunityBotRepository(
           state.chatId, state.messageId, state.actorId, state.recipientUserId,
           state.positiveReactionCount, state.negativeReactionCount,
           state.lastUpdateDate, state.lastUpdateId, timestamp,
-        ));
-      }
+        ),
+      ];
       const results = await database.batch<{ delta: number }>(statements);
       return {
         inserted: didChange(results[1]!),
@@ -377,9 +329,6 @@ export function createD1CommunityBotRepository(
           recipientUserId: reactionVibeStates.recipientUserId,
           positiveReactionCount: reactionVibeStates.positiveReactionCount,
           negativeReactionCount: reactionVibeStates.negativeReactionCount,
-          chargedNegativeReactionCount: sql<number>`(SELECT COALESCE(SUM(amount), 0)
-            FROM negative_reaction_charges
-            WHERE chat_id = ${chatId} AND message_id = ${messageId} AND actor_id = ${actorId})`,
           lastUpdateDate: reactionVibeStates.lastUpdateDate,
           lastUpdateId: reactionVibeStates.lastUpdateId,
         })
@@ -397,7 +346,6 @@ export function createD1CommunityBotRepository(
         recipientUserId: rows[0]?.recipientUserId ?? null,
         positiveReactionCount: Number(rows[0]?.positiveReactionCount ?? 0),
         negativeReactionCount: Number(rows[0]?.negativeReactionCount ?? 0),
-        chargedNegativeReactionCount: Number(rows[0]?.chargedNegativeReactionCount ?? 0),
         lastUpdateDate:
           rows[0]?.lastUpdateDate === null || rows[0]?.lastUpdateDate === undefined
             ? null

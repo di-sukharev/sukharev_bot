@@ -1016,7 +1016,7 @@ describe("community bot", () => {
     },
   );
 
-  test("subtracts and rolls back poop reaction vibe", async () => {
+  test("keeps the poop reaction charge after removal", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const queueMock = createQueueMock<VibeNotificationDeleteJob>();
     const bot = createCommunityBot(
@@ -1044,12 +1044,12 @@ describe("community bot", () => {
 
     await bot.handleUpdate(reactionUpdate(4, [emojiReaction("💩")], []));
 
-    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
     expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
     expect(telegramMethodRequests("banChatMember")).toHaveLength(0);
   });
 
-  test("subtracts and rolls back thumbs-down reaction vibe", async () => {
+  test("keeps the thumbs-down charge after removal", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const bot = createCommunityBot(
       createTestEnv("-1001", { ANNOUNCE_REACTIONS: "true" }),
@@ -1072,7 +1072,7 @@ describe("community bot", () => {
 
     await bot.handleUpdate(reactionUpdate(4, [emojiReaction("👎")], []));
 
-    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
     expect(telegramMethodRequests("deleteMessage")).toHaveLength(0);
     expect(telegramMethodRequests("banChatMember")).toHaveLength(0);
   });
@@ -1090,16 +1090,16 @@ describe("community bot", () => {
     await bot.handleUpdate(reactionUpdate(4, [], [emojiReaction("💩")], { messageId: 101 }));
     expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
 
-    // Removing an uncharged reaction must not refund vibe.
+    // Removing either reaction must not refund vibe or reset the allowance.
     await bot.handleUpdate(reactionUpdate(5, [emojiReaction("💩")], [], { messageId: 101 }));
     expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
     await bot.handleUpdate(reactionUpdate(6, [emojiReaction("👎")], []));
-    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
 
     await bot.handleUpdate(reactionUpdate(7, [], [emojiReaction("💩")]));
     await bot.handleUpdate(reactionUpdate(8, [emojiReaction("💩")], []));
     await bot.handleUpdate(reactionUpdate(9, [], [emojiReaction("👎")], { messageId: 101 }));
-    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
     expect(telegramMethodRequests("sendMessage")).toHaveLength(1);
   });
 
@@ -1118,24 +1118,24 @@ describe("community bot", () => {
 
       setSystemTime(startedAt + 24 * 60 * 60 * 1000);
       await bot.handleUpdate(reactionUpdate(5, [], [emojiReaction("👎")]));
-      expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+      expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
       await bot.handleUpdate(reactionUpdate(6, [emojiReaction("👎")], []));
 
       setSystemTime(startedAt + 48 * 60 * 60 * 1000 - 1);
       await bot.handleUpdate(reactionUpdate(7, [], [emojiReaction("👎")]));
-      expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+      expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
       await bot.handleUpdate(reactionUpdate(8, [emojiReaction("👎")], []));
 
       setSystemTime(startedAt + 48 * 60 * 60 * 1000);
       await bot.handleUpdate(reactionUpdate(9, [], [emojiReaction("👎")]));
-      expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
+      expect(await repository.getVibeScore("-1001", "10")).toBe(-2);
       expect(telegramMethodRequests("sendMessage")).toHaveLength(2);
     } finally {
       setSystemTime();
     }
   });
 
-  test("charges multiple negative emoji once and refunds only the charged amount", async () => {
+  test("charges multiple negative emoji once without refunding removals", async () => {
     const repository = new InMemoryCommunityBotRepository();
     const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: fetchMock.fetch });
     const both = [emojiReaction("👎"), emojiReaction("💩")];
@@ -1145,7 +1145,7 @@ describe("community bot", () => {
     await bot.handleUpdate(reactionUpdate(4, both, [emojiReaction("👎")]));
     expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
     await bot.handleUpdate(reactionUpdate(5, [emojiReaction("👎")], []));
-    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
   });
 
   test("does not bypass the negative announcement limit by switching positive reactions", async () => {
@@ -1158,7 +1158,7 @@ describe("community bot", () => {
     await bot.handleUpdate(reactionUpdate(3, [], [emojiReaction("👎")]));
     await bot.handleUpdate(reactionUpdate(4, [emojiReaction("👎")], [emojiReaction("👍")]));
     await bot.handleUpdate(reactionUpdate(5, [emojiReaction("👍")], [emojiReaction("💩")]));
-    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
     const negativeAnnouncements = telegramMethodRequests("sendMessage")
       .filter(request => (request.body as { text: string }).text.includes("минус"));
     expect(negativeAnnouncements).toHaveLength(1);
@@ -1191,7 +1191,7 @@ describe("community bot", () => {
     await bot.handleUpdate(reactionUpdate(8, [], [emojiReaction(third)], { actorId: 23 }));
 
     // Readding actor 20's reaction still counts for deletion, but not vibe.
-    expect(await repository.getVibeScore("-1001", "10")).toBe(-3);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-4);
     expect(telegramMethodRequests("deleteMessage")).toHaveLength(1);
     expect(telegramMethodRequests("deleteMessage")[0]?.body).toMatchObject({
       chat_id: -1001,
@@ -1427,7 +1427,7 @@ describe("community bot", () => {
       lastUpdateDate: 200,
       lastUpdateId: 100,
     });
-    expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+    expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
   });
 
   test("does not restore a stale three-reaction aggregate snapshot", async () => {

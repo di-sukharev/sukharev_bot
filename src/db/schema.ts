@@ -94,24 +94,6 @@ export const reactionVibeStates = sqliteTable(
   }),
 );
 
-export const negativeReactionCharges = sqliteTable(
-  "negative_reaction_charges",
-  {
-    chatId: text("chat_id").notNull(),
-    messageId: integer("message_id").notNull(),
-    actorId: text("actor_id").notNull(),
-    idempotencyKey: text("idempotency_key").notNull(),
-    amount: integer("amount").notNull(),
-    updateDate: integer("update_date").notNull(),
-    updateId: integer("update_id").notNull(),
-  },
-  (table) => ({
-    primaryKey: primaryKey({
-      columns: [table.chatId, table.messageId, table.actorId, table.idempotencyKey],
-    }),
-  }),
-);
-
 export const negativeReactionLimits = sqliteTable(
   "negative_reaction_limits",
   {

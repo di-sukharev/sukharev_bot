@@ -266,27 +266,6 @@ export function createCommunityBot(
         actorId,
       );
       if (isStaleReactionUpdate(previousState, reactionUpdate.date, ctx.update.update_id)) {
-        if (vibeRecipient && recipient?.id !== actorId &&
-          previousState.chargedNegativeReactionCount > 0) {
-          await ctx.repository.applyLimitedReactionVibe({
-            entry: {
-              idempotencyKey: `reaction:${ctx.update.update_id}`,
-              chatId, recipientUserId: vibeRecipient.id, actorUserId: actorId,
-              delta: 0, source: "message_reaction", reason: "late negative reaction refund",
-              sourceMessageId: null, targetMessageId: reactionUpdate.message_id,
-            },
-            state: {
-              chatId, messageId: reactionUpdate.message_id, actorId,
-              recipientUserId: vibeRecipient.id, positiveReactionCount: 0,
-              negativeReactionCount: countNegativeReactions(reactionUpdate.new_reaction),
-              lastUpdateDate: reactionUpdate.date,
-              lastUpdateId: ctx.update.update_id,
-            },
-            oldNegativeReactionCount,
-            requestNegativeCharge: false,
-            writeState: false,
-          });
-        }
         return;
       }
 
@@ -351,11 +330,9 @@ export function createCommunityBot(
             targetMessageId: reactionUpdate.message_id,
           },
           state,
-          oldNegativeReactionCount,
           requestNegativeCharge: nextState.negativeReactionCount >
             (sameRecipient ? Math.min(previousState.negativeReactionCount,
               oldNegativeReactionCount) : 0),
-          writeState: true,
         });
         vibeDelta = result.delta;
         inserted = result.inserted && vibeDelta !== 0;

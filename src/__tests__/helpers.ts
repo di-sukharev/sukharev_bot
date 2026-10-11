@@ -165,9 +165,6 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
   readonly reactionStates = new Map<string, ReactionVibeStateInput>();
   readonly reactionAwardReservations = new Map<string, string>();
   readonly negativeReactionLimits = new Map<string, number>();
-  readonly negativeReactionCharges = new Map<string, Array<{
-    key: string; amount: number; date: number; updateId: number;
-  }>>();
   readonly moderationActions = new Map<string, ModerationActionInput>();
   readonly moderationActionReservations = new Map<
     string,
@@ -245,24 +242,11 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
     return true;
   }
 
-  async applyLimitedReactionVibe({ entry, state, oldNegativeReactionCount, requestNegativeCharge, writeState }: LimitedReactionVibeInput) {
+  async applyLimitedReactionVibe({ entry, state, requestNegativeCharge }: LimitedReactionVibeInput) {
     if (this.ledger.has(entry.idempotencyKey)) {
       return { inserted: false, delta: 0, negativeChargeApplied: false };
     }
     const stateKey = reactionAwardKey(state.chatId, state.messageId, state.actorId);
-    const charges = this.negativeReactionCharges.get(stateKey) ?? [];
-    charges.sort((a, b) => a.date - b.date || a.updateId - b.updateId);
-    let capacity = Math.min(oldNegativeReactionCount, state.negativeReactionCount);
-    let refund = 0;
-    for (const charge of [...charges].reverse()) {
-      if (charge.date < state.lastUpdateDate ||
-        (charge.date === state.lastUpdateDate && charge.updateId < state.lastUpdateId)) {
-        const retained = Math.min(charge.amount, capacity);
-        capacity -= retained;
-        refund += charge.amount - retained;
-        charge.amount = retained;
-      }
-    }
     const key = `${state.chatId}:${state.actorId}:${state.recipientUserId}`;
     const now = Date.now();
     const lastCharge = this.negativeReactionLimits.get(key);
@@ -270,13 +254,10 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
       (lastCharge === undefined || now - lastCharge >= 48 * 60 * 60 * 1000));
     if (charge) {
       this.negativeReactionLimits.set(key, now);
-      charges.push({ key: entry.idempotencyKey, amount: 1,
-        date: state.lastUpdateDate, updateId: state.lastUpdateId });
     }
-    this.negativeReactionCharges.set(stateKey, charges.filter(charge => charge.amount > 0));
-    const delta = entry.delta + refund - charge;
+    const delta = entry.delta - charge;
     this.ledger.set(entry.idempotencyKey, { ...entry, delta });
-    if (writeState) this.reactionStates.set(stateKey, state);
+    this.reactionStates.set(stateKey, state);
     return { inserted: true, delta, negativeChargeApplied: charge > 0 };
   }
 
@@ -290,9 +271,6 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
       recipientUserId: state?.recipientUserId ?? null,
       positiveReactionCount: state?.positiveReactionCount ?? 0,
       negativeReactionCount: state?.negativeReactionCount ?? 0,
-      chargedNegativeReactionCount: (this.negativeReactionCharges.get(
-        reactionAwardKey(chatId, messageId, actorId),
-      ) ?? []).reduce((sum, charge) => sum + charge.amount, 0),
       lastUpdateDate: state?.lastUpdateDate ?? null,
       lastUpdateId: state?.lastUpdateId ?? null,
     };

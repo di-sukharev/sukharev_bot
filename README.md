@@ -12,7 +12,8 @@ The project is distributed under the [Apache License 2.0](LICENSE).
 - welcomes new chat members and publishes chat rules;
 - limits links to trusted domains, protected users, or members with enough vibe;
 - removes configured profanity and applies negative vibe;
-- awards and rolls back vibe for thanks replies and Telegram reactions;
+- awards and rolls back positive vibe for thanks replies and Telegram reactions;
+- applies permanent negative vibe for identifiable negative reactions;
 - deletes messages with 3 or more active 💩/👎 reactions combined;
 - permanently bans users at −10 vibe or below and requests deletion of all their
   messages in the same chat via Telegram's `revoke_messages` option;
@@ -33,10 +34,11 @@ updates arrive; existing messages and completed bans are not rescanned.
 For identifiable reaction actors, negative reactions can deduct at most one
 vibe per actor/recipient pair in the same chat during a rolling 48-hour window.
 This also limits negative reaction announcements to one per pair per window,
-across all of the recipient's messages. Removing all of an actor's negative
-reactions from a charged message refunds its charged vibe but does not reset
-the window. Removing uncharged reactions gives no refund. The allowance is
-checked when the update is processed. It does not
+across all of the recipient's messages. The deduction is permanent: removing,
+readding, or switching negative reactions does not refund vibe or reset the
+window. Denied negative reactions send no notification. Positive reaction
+awards and rollbacks retain their existing behavior.
+The allowance is checked when the update is processed. It does not
 automatically charge reactions that remain active when the window expires.
 Existing charges retain their timestamps when deploying a new window duration.
 All active negative reactions still count toward message deletion, including
@@ -182,34 +184,22 @@ Production migrations, deploys, and webhook changes refuse dirty Git trees.
 Review `git status --short --branch` and commit the intended tree first. D1
 migrations are append-only SQL files in `drizzle/migrations`.
 
-The negative reaction limit requires migration `0007_negative_reaction_limits.sql`
-before deploying the updated Worker. It preserves scores and refunds for existing
-active reactions. It seeds pair windows from the latest negative reaction ledger
-delta. Legacy entries combine negative charges and positive reaction rollbacks,
-so a recent positive rollback can also consume the initial window. Pause update
-processing for the migration and deployment, and preserve pending updates. The
-old Worker does not maintain the new refundable-charge state. After a rollback,
-reconcile that state before deploying the updated Worker again.
+The negative reaction limit requires migration `0007_negative_reaction_limits.sql`.
+It seeds pair windows from the latest negative reaction ledger delta. Legacy
+entries combine negative charges and positive reaction rollbacks, so a recent
+positive rollback can also consume the initial window. Migration
+`0008_negative_reaction_charge_origins.sql` introduced charge origins for refunds.
 
-The out-of-order refund fix additionally requires migration
-`0008_negative_reaction_charge_origins.sql`. It moves existing refundable totals
-into charge records and removes the old total column. Scores and pair-window
-timestamps do not change. New charges record their reaction date and update ID.
-A delayed removal can then refund an earlier charge without refunding a newer
-charge or replacing the latest active reaction snapshot.
+Permanent negative charges require migration `0009_permanent_negative_reactions.sql`
+before deploying this Worker. It removes the obsolete refund metadata table.
+Existing scores, active reaction snapshots, and pair-window timestamps stay
+unchanged. The migration does not rescan messages or restore refunded charges.
 
-Legacy totals do not identify the individual reaction events that incurred them.
-Migration `0008` uses each last stored snapshot as a conservative baseline.
-Removals older than that baseline cannot refund the migrated total. Later
-removals retain the existing refunds. The migration does not reconstruct missing
-history or rescan Telegram messages.
-
-Pause update processing and preserve pending updates while applying `0008` and
-deploying its Worker. The previous Worker is incompatible with the migrated
-schema. Prefer a forward fix. A rollback needs update processing paused and a
-reviewed schema/data conversion that restores refundable totals from the charge
-records before deploying the previous Worker. Do not redeploy the new Worker
-after an old Worker has processed updates without reconciling charge origins.
+Pause update processing and preserve pending Telegram updates while applying
+`0009` and deploying its Worker. The previous Worker needs the removed table
+and cannot run against this schema. Prefer a forward fix. A rollback requires
+paused processing and a reviewed schema/data conversion before deploying the
+previous Worker. Resume the webhook only after deploying a compatible Worker.
 
 ## License
 
