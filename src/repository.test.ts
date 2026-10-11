@@ -30,6 +30,164 @@ beforeAll(async () => {
 });
 
 describe("D1 negative reaction limits", () => {
+  test("keeps positive scoring when an out-of-order snapshot refunds a negative charge", async () => {
+    const telegram = installTelegramFetchMock();
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
+    try {
+      await bot.handleUpdate(storedMessageUpdate(6800, 6800, 6800));
+      await bot.handleUpdate(negativeReactionUpdate(6801, 6800, {
+        actorId: 68, newEmojis: ["👎", "👍"],
+      }));
+      await bot.handleUpdate(negativeReactionUpdate(6803, 6800, {
+        actorId: 68, oldEmojis: ["👍"], newEmojis: ["👎", "👍"],
+      }));
+      await bot.handleUpdate(negativeReactionUpdate(6802, 6800, {
+        actorId: 68, oldEmojis: ["👎", "👍"], newEmojis: ["👍"],
+      }));
+      expect(await repository.getVibeScore("-1001", "6800")).toBe(1);
+      expect(await repository.getReactionVibeState("-1001", 6800, "68"))
+        .toMatchObject({ positiveReactionCount: 1, negativeReactionCount: 1,
+          chargedNegativeReactionCount: 0, lastUpdateId: 6803 });
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("refunds a removed charge when removal and re-addition arrive out of order", async () => {
+    const telegram = installTelegramFetchMock();
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
+    try {
+      await bot.handleUpdate(storedMessageUpdate(600, 600, 600));
+      await bot.handleUpdate(negativeReactionUpdate(601, 600, { actorId: 60 }));
+      await bot.handleUpdate(negativeReactionUpdate(603, 600, { actorId: 60 }));
+      await bot.handleUpdate(negativeReactionUpdate(602, 600, { actorId: 60, remove: true }));
+
+      expect((await repository.getReactionVibeState("-1001", 600, "60")))
+        .toMatchObject({ negativeReactionCount: 1, chargedNegativeReactionCount: 0, lastUpdateId: 603 });
+      expect(await database.prepare(
+        "SELECT SUM(delta) AS score FROM vibe_ledger WHERE actor_user_id = '60'",
+      ).first<number>("score")).toBe(0);
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test.each(["switch", "add"] as const)(
+    "refunds an earlier charge with newest-first remove, re-add, and %s snapshots",
+    async variant => {
+      const actorId = variant === "switch" ? 61 : 62;
+      const messageId = actorId * 100;
+      const telegram = installTelegramFetchMock();
+      const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
+      try {
+        await bot.handleUpdate(storedMessageUpdate(messageId, messageId, messageId));
+        await bot.handleUpdate(negativeReactionUpdate(messageId + 1, messageId, { actorId }));
+        const anchor = await database.prepare(
+          "SELECT charged_at FROM negative_reaction_limits WHERE actor_id = ?",
+        ).bind(String(actorId)).first<string>("charged_at");
+        await bot.handleUpdate(negativeReactionUpdate(messageId + 4, messageId, {
+          actorId, oldEmojis: ["👎"], newEmojis: variant === "switch" ? ["💩"] : ["👎", "💩"],
+        }));
+        await bot.handleUpdate(negativeReactionUpdate(messageId + 3, messageId, { actorId }));
+        const removal = negativeReactionUpdate(messageId + 2, messageId, { actorId, remove: true });
+        await bot.handleUpdate(removal);
+        await bot.handleUpdate(removal);
+        expect(await database.prepare(
+          "SELECT SUM(delta) AS score FROM vibe_ledger WHERE actor_user_id = ?",
+        ).bind(String(actorId)).first<number>("score")).toBe(0);
+        expect(await repository.getReactionVibeState("-1001", messageId, String(actorId)))
+          .toMatchObject({ negativeReactionCount: variant === "switch" ? 1 : 2,
+            chargedNegativeReactionCount: 0, lastUpdateId: messageId + 4 });
+        expect(await database.prepare(
+          "SELECT charged_at FROM negative_reaction_limits WHERE actor_id = ?",
+        ).bind(String(actorId)).first<string>("charged_at")).toBe(anchor);
+      } finally {
+        telegram.restore();
+      }
+    },
+  );
+
+  test("a stale removal refunds only the earlier charge after a new window charge", async () => {
+    const start = Date.parse("2026-10-10T12:00:00.000Z");
+    const actorId = 63;
+    const messageId = 6300;
+    const telegram = installTelegramFetchMock();
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
+    setSystemTime(start);
+    try {
+      await bot.handleUpdate(storedMessageUpdate(messageId, messageId, messageId));
+      await bot.handleUpdate(negativeReactionUpdate(messageId + 1, messageId, { actorId }));
+      setSystemTime(start + 48 * 60 * 60 * 1000);
+      await bot.handleUpdate(negativeReactionUpdate(messageId + 4, messageId, {
+        actorId, oldEmojis: ["👎"], newEmojis: ["👎", "💩"],
+      }));
+      expect(await database.prepare(
+        "SELECT SUM(delta) AS score FROM vibe_ledger WHERE actor_user_id = ?",
+      ).bind(String(actorId)).first<number>("score")).toBe(-2);
+      await bot.handleUpdate(negativeReactionUpdate(messageId + 3, messageId, { actorId }));
+      const removal = negativeReactionUpdate(messageId + 2, messageId, { actorId, remove: true });
+      await bot.handleUpdate(removal);
+      await bot.handleUpdate(removal);
+      expect(await database.prepare(
+        "SELECT SUM(delta) AS score FROM vibe_ledger WHERE actor_user_id = ?",
+      ).bind(String(actorId)).first<number>("score")).toBe(-1);
+      expect(await repository.getReactionVibeState("-1001", messageId, String(actorId)))
+        .toMatchObject({ negativeReactionCount: 2, chargedNegativeReactionCount: 1,
+          lastUpdateId: messageId + 4 });
+      expect(await database.prepare(
+        "SELECT charged_at FROM negative_reaction_limits WHERE actor_id = ?",
+      ).bind(String(actorId)).first<string>("charged_at"))
+        .toBe(new Date(start + 48 * 60 * 60 * 1000).toISOString());
+    } finally {
+      setSystemTime();
+      telegram.restore();
+    }
+  });
+
+  test.each([
+    { newestFirst: false, expiresAgain: false, actorId: 65 },
+    { newestFirst: true, expiresAgain: false, actorId: 66 },
+    { newestFirst: true, expiresAgain: true, actorId: 67 },
+  ])("reconciles partial removal and re-addition: %j", async ({ newestFirst, expiresAgain, actorId }) => {
+    const messageId = actorId * 100;
+    const start = Date.parse("2026-10-10T12:00:00.000Z");
+    const telegram = installTelegramFetchMock();
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
+    setSystemTime(start);
+    try {
+      await bot.handleUpdate(storedMessageUpdate(messageId, messageId, messageId));
+      await bot.handleUpdate(negativeReactionUpdate(messageId + 1, messageId, { actorId }));
+      setSystemTime(start + 48 * 60 * 60 * 1000);
+      await bot.handleUpdate(negativeReactionUpdate(messageId + 2, messageId, {
+        actorId, oldEmojis: ["👎"], newEmojis: ["👎", "💩"],
+      }));
+      const anchor = await database.prepare(
+        "SELECT charged_at FROM negative_reaction_limits WHERE actor_id = ?",
+      ).bind(String(actorId)).first<string>("charged_at");
+      const remove = negativeReactionUpdate(messageId + 3, messageId, {
+        actorId, oldEmojis: ["👎", "💩"], newEmojis: ["👎"],
+      });
+      const reAdd = negativeReactionUpdate(messageId + 4, messageId, {
+        actorId, oldEmojis: ["👎"], newEmojis: ["👎", "💩"],
+      });
+      if (expiresAgain) setSystemTime(start + 96 * 60 * 60 * 1000);
+      for (const update of newestFirst ? [reAdd, remove, remove] : [remove, reAdd]) {
+        await bot.handleUpdate(update);
+      }
+      expect(await repository.getVibeScore("-1001", String(messageId))).toBe(expiresAgain ? -2 : -1);
+      expect(await repository.getReactionVibeState("-1001", messageId, String(actorId)))
+        .toMatchObject({ negativeReactionCount: 2, chargedNegativeReactionCount: expiresAgain ? 2 : 1,
+          lastUpdateId: messageId + 4 });
+      expect(await database.prepare(
+        "SELECT charged_at FROM negative_reaction_limits WHERE actor_id = ?",
+      ).bind(String(actorId)).first<string>("charged_at"))
+        .toBe(expiresAgain ? new Date(start + 96 * 60 * 60 * 1000).toISOString() : anchor);
+    } finally {
+      setSystemTime();
+      telegram.restore();
+    }
+  });
+
   test("migrates legacy scores, refundable reactions, and recent pair allowances", async () => {
     const legacyDb = (await miniflare.getD1Database("LEGACY")) as unknown as D1Database;
     const migrations = Array.from(new Bun.Glob("*.sql").scanSync("drizzle/migrations")).sort();
@@ -49,8 +207,14 @@ describe("D1 negative reaction limits", () => {
       .bind(...Array(4).fill(new Date().toISOString())).run();
     const oldCharge = limitedReactionInput("legacy-actor", 1).entry;
     await createD1CommunityBotRepository(legacyDb).addVibeLedgerEntry({ ...oldCharge, delta: -2 });
+    await legacyDb.prepare(`UPDATE reaction_vibe_states
+      SET last_update_date = 100, last_update_id = 100 WHERE message_id = 1`).run();
 
     await applyMigration(legacyDb, "0007_negative_reaction_limits.sql");
+    const originalAnchor = await legacyDb.prepare(
+      "SELECT charged_at FROM negative_reaction_limits WHERE actor_id = 'legacy-actor'",
+    ).first<string>("charged_at");
+    await applyMigration(legacyDb, "0008_negative_reaction_charge_origins.sql");
     const legacyRepo = createD1CommunityBotRepository(legacyDb);
     expect(await legacyRepo.getVibeScore("-1001", "10")).toBe(-2);
     expect((await legacyRepo.getReactionVibeState("-1001", 1, "legacy-actor"))
@@ -60,16 +224,59 @@ describe("D1 negative reaction limits", () => {
         .chargedNegativeReactionCount).toBe(0);
     }
 
+    const historicalRemoval = limitedReactionInput("legacy-actor", 1);
+    historicalRemoval.entry.idempotencyKey = "legacy-historical-removal";
+    historicalRemoval.state.lastUpdateDate = 99;
+    historicalRemoval.state.lastUpdateId = 99;
+    historicalRemoval.state.negativeReactionCount = 0;
+    historicalRemoval.requestNegativeCharge = false;
+    historicalRemoval.writeState = false;
+    await legacyRepo.applyLimitedReactionVibe(historicalRemoval);
+    expect(await legacyRepo.getVibeScore("-1001", "10")).toBe(-2);
+
     const refund = limitedReactionInput("legacy-actor", 1);
     refund.entry.idempotencyKey = "legacy-refund";
-    refund.entry.delta = 2;
+    refund.entry.delta = 0;
     refund.state.negativeReactionCount = 0;
     refund.requestNegativeCharge = false;
+    refund.oldNegativeReactionCount = 2;
+    refund.state.lastUpdateId = 101;
+    refund.state.lastUpdateDate = 101;
     await legacyRepo.applyLimitedReactionVibe(refund);
     expect(await legacyRepo.getVibeScore("-1001", "10")).toBe(0);
     expect((await legacyRepo.applyLimitedReactionVibe(limitedReactionInput("legacy-actor", 5)))
       .negativeChargeApplied).toBe(false);
     expect(await legacyRepo.getVibeScore("-1001", "10")).toBe(0);
+    expect(await legacyDb.prepare(
+      "SELECT charged_at FROM negative_reaction_limits WHERE actor_id = 'legacy-actor'",
+    ).first<string>("charged_at")).toBe(originalAnchor);
+  });
+
+  test("rolls back charge refunds with a failed snapshot write and safely retries", async () => {
+    const telegram = installTelegramFetchMock();
+    const bot = createCommunityBot(createTestEnv(), { repository, apiFetch: telegram.fetch });
+    try {
+      await bot.handleUpdate(storedMessageUpdate(6400, 6400, 6400));
+      await bot.handleUpdate(negativeReactionUpdate(6401, 6400, { actorId: 64 }));
+      await database.prepare(`CREATE TRIGGER fail_refund_snapshot
+        BEFORE INSERT ON reaction_vibe_states WHEN NEW.actor_id = '64'
+        BEGIN SELECT RAISE(ABORT, 'test refund write failure'); END`).run();
+      const removal = negativeReactionUpdate(6402, 6400, { actorId: 64, remove: true });
+      try {
+        await expect(bot.handleUpdate(removal)).rejects.toThrow();
+        expect(await repository.getVibeScore("-1001", "6400")).toBe(-1);
+        expect(await repository.getReactionVibeState("-1001", 6400, "64"))
+          .toMatchObject({ chargedNegativeReactionCount: 1, lastUpdateId: 6401 });
+      } finally {
+        await database.prepare("DROP TRIGGER fail_refund_snapshot").run();
+      }
+      await bot.handleUpdate(removal);
+      expect(await repository.getVibeScore("-1001", "6400")).toBe(0);
+      expect((await repository.getReactionVibeState("-1001", 6400, "64")))
+        .toMatchObject({ chargedNegativeReactionCount: 0, negativeReactionCount: 0 });
+    } finally {
+      telegram.restore();
+    }
   });
 
   test("limits concurrent real bot updates across messages and keeps refunds exact", async () => {
@@ -182,9 +389,11 @@ function limitedReactionInput(actorId: string, messageId: number): LimitedReacti
     state: {
       chatId: "-1001", messageId, actorId, recipientUserId: "10",
       positiveReactionCount: 0, negativeReactionCount: 1,
-      chargedNegativeReactionCount: 0, lastUpdateDate: messageId, lastUpdateId: messageId,
+      lastUpdateDate: messageId, lastUpdateId: messageId,
     },
+    oldNegativeReactionCount: 0,
     requestNegativeCharge: true,
+    writeState: true,
   };
 }
 
@@ -202,7 +411,8 @@ function storedMessageUpdate(updateId: number, messageId: number, authorId = 10,
 
 function negativeReactionUpdate(
   updateId: number, messageId: number,
-  options: { remove?: boolean; actorId?: number; chatId?: number } = {},
+  options: { remove?: boolean; actorId?: number; chatId?: number;
+    oldEmojis?: Array<"👎" | "💩" | "👍">; newEmojis?: Array<"👎" | "💩" | "👍"> } = {},
 ): Update {
   const reaction = { type: "emoji" as const, emoji: "👎" as const };
   return {
@@ -211,8 +421,10 @@ function negativeReactionUpdate(
       chat: { id: options.chatId ?? -1001, type: "supergroup", title: "Test" },
       message_id: messageId, date: updateId,
       user: { id: options.actorId ?? 20, is_bot: false, first_name: "Actor" },
-      old_reaction: options.remove ? [reaction] : [],
-      new_reaction: options.remove ? [] : [reaction],
+      old_reaction: options.oldEmojis?.map(emoji => ({ type: "emoji" as const, emoji })) ??
+        (options.remove ? [reaction] : []),
+      new_reaction: options.newEmojis?.map(emoji => ({ type: "emoji" as const, emoji })) ??
+        (options.remove ? [] : [reaction]),
     },
   };
 }

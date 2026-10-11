@@ -191,6 +191,26 @@ processing for the migration and deployment, and preserve pending updates. The
 old Worker does not maintain the new refundable-charge state. After a rollback,
 reconcile that state before deploying the updated Worker again.
 
+The out-of-order refund fix additionally requires migration
+`0008_negative_reaction_charge_origins.sql`. It moves existing refundable totals
+into charge records and removes the old total column. Scores and pair-window
+timestamps do not change. New charges record their reaction date and update ID.
+A delayed removal can then refund an earlier charge without refunding a newer
+charge or replacing the latest active reaction snapshot.
+
+Legacy totals do not identify the individual reaction events that incurred them.
+Migration `0008` uses each last stored snapshot as a conservative baseline.
+Removals older than that baseline cannot refund the migrated total. Later
+removals retain the existing refunds. The migration does not reconstruct missing
+history or rescan Telegram messages.
+
+Pause update processing and preserve pending updates while applying `0008` and
+deploying its Worker. The previous Worker is incompatible with the migrated
+schema. Prefer a forward fix. A rollback needs update processing paused and a
+reviewed schema/data conversion that restores refundable totals from the charge
+records before deploying the previous Worker. Do not redeploy the new Worker
+after an old Worker has processed updates without reconciling charge origins.
+
 ## License
 
 Copyright 2026 Dima Sukharev.

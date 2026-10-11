@@ -238,6 +238,7 @@ export function createCommunityBot(
     const reactionUpdate = ctx.update.message_reaction as MessageReactionUpdate;
     const actorUser = reactionUpdate.user;
     const actorId = getReactionActorId(reactionUpdate);
+    const oldNegativeReactionCount = countNegativeReactions(reactionUpdate.old_reaction);
     if (!actorId) {
       return;
     }
@@ -265,6 +266,27 @@ export function createCommunityBot(
         actorId,
       );
       if (isStaleReactionUpdate(previousState, reactionUpdate.date, ctx.update.update_id)) {
+        if (vibeRecipient && recipient?.id !== actorId &&
+          previousState.chargedNegativeReactionCount > 0) {
+          await ctx.repository.applyLimitedReactionVibe({
+            entry: {
+              idempotencyKey: `reaction:${ctx.update.update_id}`,
+              chatId, recipientUserId: vibeRecipient.id, actorUserId: actorId,
+              delta: 0, source: "message_reaction", reason: "late negative reaction refund",
+              sourceMessageId: null, targetMessageId: reactionUpdate.message_id,
+            },
+            state: {
+              chatId, messageId: reactionUpdate.message_id, actorId,
+              recipientUserId: vibeRecipient.id, positiveReactionCount: 0,
+              negativeReactionCount: countNegativeReactions(reactionUpdate.new_reaction),
+              lastUpdateDate: reactionUpdate.date,
+              lastUpdateId: ctx.update.update_id,
+            },
+            oldNegativeReactionCount,
+            requestNegativeCharge: false,
+            writeState: false,
+          });
+        }
         return;
       }
 
@@ -276,7 +298,6 @@ export function createCommunityBot(
           recipientUserId: recipient.id,
           positiveReactionCount: 0,
           negativeReactionCount: 0,
-          chargedNegativeReactionCount: 0,
           lastUpdateDate: reactionUpdate.date,
           lastUpdateId: ctx.update.update_id,
         });
@@ -305,7 +326,6 @@ export function createCommunityBot(
         actorId,
         recipientUserId: recipient?.id ?? UNKNOWN_MESSAGE_AUTHOR_ID,
         ...nextState,
-        chargedNegativeReactionCount: 0,
         lastUpdateDate: reactionUpdate.date,
         lastUpdateId: ctx.update.update_id,
       };
@@ -317,8 +337,6 @@ export function createCommunityBot(
       ) {
         const sameRecipient = previousState.recipientUserId === null ||
           previousState.recipientUserId === vibeRecipient.id;
-        const previousCharged = sameRecipient ? previousState.chargedNegativeReactionCount : 0;
-        const retainedCharges = Math.min(previousCharged, nextState.negativeReactionCount);
         const result = await ctx.repository.applyLimitedReactionVibe({
           entry: {
             idempotencyKey: `reaction:${ctx.update.update_id}`,
@@ -326,16 +344,18 @@ export function createCommunityBot(
             recipientUserId: vibeRecipient.id,
             actorUserId: actorId,
             delta: nextState.positiveReactionCount -
-              (sameRecipient ? previousState.positiveReactionCount : 0) +
-              previousCharged - retainedCharges,
+              (sameRecipient ? previousState.positiveReactionCount : 0),
             source: "message_reaction",
             reason: "reaction vibe delta",
             sourceMessageId: null,
             targetMessageId: reactionUpdate.message_id,
           },
-          state: { ...state, chargedNegativeReactionCount: retainedCharges },
+          state,
+          oldNegativeReactionCount,
           requestNegativeCharge: nextState.negativeReactionCount >
-            (sameRecipient ? previousState.negativeReactionCount : 0),
+            (sameRecipient ? Math.min(previousState.negativeReactionCount,
+              oldNegativeReactionCount) : 0),
+          writeState: true,
         });
         vibeDelta = result.delta;
         inserted = result.inserted && vibeDelta !== 0;
@@ -459,7 +479,6 @@ export function createCommunityBot(
         actorId: AGGREGATE_REACTION_ACTOR_ID,
         recipientUserId: recipient?.id ?? UNKNOWN_MESSAGE_AUTHOR_ID,
         ...nextState,
-        chargedNegativeReactionCount: 0,
         lastUpdateDate: reactionUpdate.date,
         lastUpdateId: ctx.update.update_id,
       });

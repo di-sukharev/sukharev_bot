@@ -12,6 +12,7 @@ import type {
 } from "./types";
 import {
   moderationActions,
+  negativeReactionCharges,
   reactionAwardReservations,
   processedUpdates,
   reactionVibeStates,
@@ -251,9 +252,40 @@ export function createD1CommunityBotRepository(
       return didChange(result);
     },
 
-    async applyLimitedReactionVibe({ entry, state, requestNegativeCharge }) {
+    async applyLimitedReactionVibe({ entry, state, oldNegativeReactionCount, requestNegativeCharge, writeState }) {
       const timestamp = nowIso();
       const cutoff = new Date(Date.parse(timestamp) - NEGATIVE_REACTION_LIMIT_WINDOW_MS).toISOString();
+      const charges = await db.select().from(negativeReactionCharges).where(and(
+        eq(negativeReactionCharges.chatId, state.chatId),
+        eq(negativeReactionCharges.messageId, state.messageId),
+        eq(negativeReactionCharges.actorId, state.actorId),
+      ));
+      charges.sort((a, b) => a.updateDate - b.updateDate || a.updateId - b.updateId);
+      // Both sides of the incoming event bound earlier refundable charges.
+      // Retain the newest eligible charges first. Repeated or stale bounds are
+      // then idempotent, and charges originating after this event survive.
+      let capacity = Math.min(oldNegativeReactionCount, state.negativeReactionCount);
+      const plans = charges.map(charge => ({ ...charge, retained: charge.amount }));
+      for (const plan of [...plans].reverse()) {
+        if (plan.updateDate < state.lastUpdateDate ||
+          (plan.updateDate === state.lastUpdateDate && plan.updateId < state.lastUpdateId)) {
+          plan.retained = Math.min(plan.amount, capacity);
+          capacity -= plan.retained;
+        }
+      }
+      const refunds = plans.filter(plan => plan.retained < plan.amount);
+      const refundBindings = refunds.flatMap(plan => [plan.idempotencyKey, plan.retained]);
+      const refundSql = refunds.length === 0 ? "0" : `COALESCE((
+        SELECT SUM(MAX(0, amount - CASE idempotency_key
+          ${refunds.map(() => "WHEN ? THEN ?").join(" ")} END))
+        FROM negative_reaction_charges
+        WHERE chat_id = ? AND message_id = ? AND actor_id = ?
+          AND idempotency_key IN (${refunds.map(() => "?").join(", ")})
+      ), 0)`;
+      if (refunds.length > 0) {
+        refundBindings.push(state.chatId, state.messageId, state.actorId,
+          ...refunds.map(plan => plan.idempotencyKey));
+      }
       const chargeRequested = Number(requestNegativeCharge);
       const chargeBindings = [
         chargeRequested, state.chatId, state.actorId,
@@ -265,10 +297,9 @@ export function createD1CommunityBotRepository(
           AND idempotency_key = ?
       ) THEN 1 ELSE 0 END`;
 
-      // D1 batches are transactions. Claiming the pair's allowance, writing the
-      // ledger, and recording refundable charges must succeed together.
-      // Zero-delta entries preserve denied decisions when Telegram retries.
-      const results = await database.batch<{ delta: number }>([
+      // The per-message reservation protects the refund plan. D1 applies the
+      // pair claim, actual refund amounts, ledger, and charge origins atomically.
+      const statements = [
         database.prepare(`
           INSERT INTO negative_reaction_limits
             (chat_id, actor_id, recipient_user_id, charged_at, idempotency_key)
@@ -288,24 +319,39 @@ export function createD1CommunityBotRepository(
           INSERT OR IGNORE INTO vibe_ledger (
             idempotency_key, chat_id, recipient_user_id, actor_user_id, delta,
             source, reason, source_message_id, target_message_id, created_at
-          ) VALUES (?, ?, ?, ?, ? - ${chargeSql}, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ? + ${refundSql} - ${chargeSql}, ?, ?, ?, ?, ?)
           RETURNING delta
         `).bind(
           entry.idempotencyKey, entry.chatId, entry.recipientUserId,
-          entry.actorUserId, entry.delta, ...chargeBindings, entry.source,
+          entry.actorUserId, entry.delta, ...refundBindings, ...chargeBindings, entry.source,
           entry.reason, entry.sourceMessageId, entry.targetMessageId, timestamp,
         ),
+        ...refunds.map(plan => database.prepare(`
+          UPDATE negative_reaction_charges SET amount = MIN(amount, ?)
+          WHERE chat_id = ? AND message_id = ? AND actor_id = ? AND idempotency_key = ?
+        `).bind(plan.retained, state.chatId, state.messageId, state.actorId, plan.idempotencyKey)),
         database.prepare(`
+          DELETE FROM negative_reaction_charges
+          WHERE chat_id = ? AND message_id = ? AND actor_id = ? AND amount = 0
+        `).bind(state.chatId, state.messageId, state.actorId),
+        database.prepare(`
+          INSERT OR IGNORE INTO negative_reaction_charges (
+            chat_id, message_id, actor_id, idempotency_key, amount, update_date, update_id
+          ) SELECT ?, ?, ?, ?, 1, ?, ? WHERE ${chargeSql}
+        `).bind(state.chatId, state.messageId, state.actorId, entry.idempotencyKey,
+          state.lastUpdateDate, state.lastUpdateId, ...chargeBindings),
+      ];
+      if (writeState) {
+        statements.push(database.prepare(`
           INSERT INTO reaction_vibe_states (
             chat_id, message_id, actor_id, recipient_user_id,
             positive_reaction_count, poop_reaction_count,
-            charged_negative_reaction_count, last_update_date, last_update_id, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ? + ${chargeSql}, ?, ?, ?)
+            last_update_date, last_update_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT (chat_id, message_id, actor_id) DO UPDATE SET
             recipient_user_id = excluded.recipient_user_id,
             positive_reaction_count = excluded.positive_reaction_count,
             poop_reaction_count = excluded.poop_reaction_count,
-            charged_negative_reaction_count = excluded.charged_negative_reaction_count,
             last_update_date = excluded.last_update_date,
             last_update_id = excluded.last_update_id,
             updated_at = excluded.updated_at
@@ -314,11 +360,10 @@ export function createD1CommunityBotRepository(
         `).bind(
           state.chatId, state.messageId, state.actorId, state.recipientUserId,
           state.positiveReactionCount, state.negativeReactionCount,
-          state.chargedNegativeReactionCount, ...chargeBindings,
           state.lastUpdateDate, state.lastUpdateId, timestamp,
-        ),
-      ]);
-
+        ));
+      }
+      const results = await database.batch<{ delta: number }>(statements);
       return {
         inserted: didChange(results[1]!),
         delta: results[1]?.results[0]?.delta ?? 0,
@@ -332,7 +377,9 @@ export function createD1CommunityBotRepository(
           recipientUserId: reactionVibeStates.recipientUserId,
           positiveReactionCount: reactionVibeStates.positiveReactionCount,
           negativeReactionCount: reactionVibeStates.negativeReactionCount,
-          chargedNegativeReactionCount: reactionVibeStates.chargedNegativeReactionCount,
+          chargedNegativeReactionCount: sql<number>`(SELECT COALESCE(SUM(amount), 0)
+            FROM negative_reaction_charges
+            WHERE chat_id = ${chatId} AND message_id = ${messageId} AND actor_id = ${actorId})`,
           lastUpdateDate: reactionVibeStates.lastUpdateDate,
           lastUpdateId: reactionVibeStates.lastUpdateId,
         })
@@ -426,7 +473,6 @@ export function createD1CommunityBotRepository(
           recipientUserId: input.recipientUserId,
           positiveReactionCount: input.positiveReactionCount,
           negativeReactionCount: input.negativeReactionCount,
-          chargedNegativeReactionCount: input.chargedNegativeReactionCount,
           lastUpdateDate: input.lastUpdateDate,
           lastUpdateId: input.lastUpdateId,
           updatedAt: nowIso(),
@@ -441,7 +487,6 @@ export function createD1CommunityBotRepository(
             recipientUserId: input.recipientUserId,
             positiveReactionCount: input.positiveReactionCount,
             negativeReactionCount: input.negativeReactionCount,
-            chargedNegativeReactionCount: input.chargedNegativeReactionCount,
             lastUpdateDate: input.lastUpdateDate,
             lastUpdateId: input.lastUpdateId,
             updatedAt: nowIso(),
