@@ -250,7 +250,7 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
     const now = Date.now();
     const lastCharge = this.negativeReactionLimits.get(key);
     const charge = Number(requestNegativeCharge &&
-      (lastCharge === undefined || now - lastCharge >= 24 * 60 * 60 * 1000));
+      (lastCharge === undefined || now - lastCharge >= 48 * 60 * 60 * 1000));
     if (charge) {
       this.negativeReactionLimits.set(key, now);
     }

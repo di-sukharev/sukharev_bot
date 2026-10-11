@@ -139,20 +139,24 @@ describe("D1 negative reaction limits", () => {
     )).chargedNegativeReactionCount).toBe(1);
   });
 
-  test("uses a rolling D1 allowance without extending it for denied reactions", async () => {
+  test("uses a rolling forty-eight-hour D1 allowance without extending it for denied reactions", async () => {
     const start = Date.parse("2026-10-10T12:00:00.000Z");
     setSystemTime(start);
     try {
       expect((await repository.applyLimitedReactionVibe(
         limitedReactionInput("rolling-window", 1),
       )).negativeChargeApplied).toBe(true);
-      setSystemTime(start + 24 * 60 * 60 * 1000 - 1);
+      setSystemTime(start + 24 * 60 * 60 * 1000);
       expect((await repository.applyLimitedReactionVibe(
         limitedReactionInput("rolling-window", 2),
       )).negativeChargeApplied).toBe(false);
-      setSystemTime(start + 24 * 60 * 60 * 1000);
+      setSystemTime(start + 48 * 60 * 60 * 1000 - 1);
       expect((await repository.applyLimitedReactionVibe(
         limitedReactionInput("rolling-window", 3),
+      )).negativeChargeApplied).toBe(false);
+      setSystemTime(start + 48 * 60 * 60 * 1000);
+      expect((await repository.applyLimitedReactionVibe(
+        limitedReactionInput("rolling-window", 4),
       )).negativeChargeApplied).toBe(true);
     } finally {
       setSystemTime();

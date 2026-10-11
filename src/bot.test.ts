@@ -1103,7 +1103,7 @@ describe("community bot", () => {
     expect(telegramMethodRequests("sendMessage")).toHaveLength(1);
   });
 
-  test("reopens the negative vibe allowance only after a rolling twenty-four hours", async () => {
+  test("reopens the negative vibe allowance only after a rolling forty-eight hours", async () => {
     const startedAt = new Date("2026-10-10T12:00:00.000Z").getTime();
     setSystemTime(startedAt);
     try {
@@ -1116,13 +1116,18 @@ describe("community bot", () => {
       await bot.handleUpdate(reactionUpdate(3, [], [emojiReaction("👎")]));
       await bot.handleUpdate(reactionUpdate(4, [emojiReaction("👎")], []));
 
-      setSystemTime(startedAt + 24 * 60 * 60 * 1000 - 1);
+      setSystemTime(startedAt + 24 * 60 * 60 * 1000);
       await bot.handleUpdate(reactionUpdate(5, [], [emojiReaction("👎")]));
       expect(await repository.getVibeScore("-1001", "10")).toBe(0);
       await bot.handleUpdate(reactionUpdate(6, [emojiReaction("👎")], []));
 
-      setSystemTime(startedAt + 24 * 60 * 60 * 1000);
+      setSystemTime(startedAt + 48 * 60 * 60 * 1000 - 1);
       await bot.handleUpdate(reactionUpdate(7, [], [emojiReaction("👎")]));
+      expect(await repository.getVibeScore("-1001", "10")).toBe(0);
+      await bot.handleUpdate(reactionUpdate(8, [emojiReaction("👎")], []));
+
+      setSystemTime(startedAt + 48 * 60 * 60 * 1000);
+      await bot.handleUpdate(reactionUpdate(9, [], [emojiReaction("👎")]));
       expect(await repository.getVibeScore("-1001", "10")).toBe(-1);
       expect(telegramMethodRequests("sendMessage")).toHaveLength(2);
     } finally {

@@ -31,13 +31,14 @@ Identifiable self-reactions do not count. Moderation runs when new
 updates arrive; existing messages and completed bans are not rescanned.
 
 For identifiable reaction actors, negative reactions can deduct at most one
-vibe per actor/recipient pair in the same chat during a rolling 24-hour window.
+vibe per actor/recipient pair in the same chat during a rolling 48-hour window.
 This also limits negative reaction announcements to one per pair per window,
 across all of the recipient's messages. Removing all of an actor's negative
 reactions from a charged message refunds its charged vibe but does not reset
 the window. Removing uncharged reactions gives no refund. The allowance is
 checked when the update is processed. It does not
 automatically charge reactions that remain active when the window expires.
+Existing charges retain their timestamps when deploying a new window duration.
 All active negative reactions still count toward message deletion, including
 reactions that did not deduct vibe. Anonymous aggregate reaction counts have
 no actor identity and retain their existing scoring and announcement behavior.
