@@ -1,5 +1,6 @@
 import type {
   CommunityBotRepository,
+  LimitedReactionVibeInput,
   ModerationActionInput,
   ModerationActionReservation,
   ReactionVibeState,
@@ -147,6 +148,7 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
   readonly processingUpdates = new Map<number, string>();
   readonly reactionStates = new Map<string, ReactionVibeStateInput>();
   readonly reactionAwardReservations = new Map<string, string>();
+  readonly negativeReactionLimits = new Map<string, number>();
   readonly moderationActions = new Map<string, ModerationActionInput>();
   readonly moderationActionReservations = new Map<
     string,
@@ -224,6 +226,27 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
     return true;
   }
 
+  async applyLimitedReactionVibe({ entry, state, requestNegativeCharge }: LimitedReactionVibeInput) {
+    if (this.ledger.has(entry.idempotencyKey)) {
+      return { inserted: false, delta: 0, negativeChargeApplied: false };
+    }
+    const key = `${state.chatId}:${state.actorId}:${state.recipientUserId}`;
+    const now = Date.now();
+    const lastCharge = this.negativeReactionLimits.get(key);
+    const charge = Number(requestNegativeCharge &&
+      (lastCharge === undefined || now - lastCharge >= 24 * 60 * 60 * 1000));
+    if (charge) {
+      this.negativeReactionLimits.set(key, now);
+    }
+    const delta = entry.delta - charge;
+    this.ledger.set(entry.idempotencyKey, { ...entry, delta });
+    this.reactionStates.set(reactionAwardKey(state.chatId, state.messageId, state.actorId), {
+      ...state,
+      chargedNegativeReactionCount: state.chargedNegativeReactionCount + charge,
+    });
+    return { inserted: true, delta, negativeChargeApplied: charge > 0 };
+  }
+
   async getReactionVibeState(
     chatId: string,
     messageId: number,
@@ -234,6 +257,7 @@ export class InMemoryCommunityBotRepository implements CommunityBotRepository {
       recipientUserId: state?.recipientUserId ?? null,
       positiveReactionCount: state?.positiveReactionCount ?? 0,
       negativeReactionCount: state?.negativeReactionCount ?? 0,
+      chargedNegativeReactionCount: state?.chargedNegativeReactionCount ?? 0,
       lastUpdateDate: state?.lastUpdateDate ?? null,
       lastUpdateId: state?.lastUpdateId ?? null,
     };

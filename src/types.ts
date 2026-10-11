@@ -70,6 +70,7 @@ export type ReactionVibeState = {
   recipientUserId: string | null;
   positiveReactionCount: number;
   negativeReactionCount: number;
+  chargedNegativeReactionCount: number;
   lastUpdateDate: number | null;
   lastUpdateId: number | null;
 };
@@ -81,8 +82,17 @@ export type ReactionVibeStateInput = {
   recipientUserId: string;
   positiveReactionCount: number;
   negativeReactionCount: number;
+  chargedNegativeReactionCount: number;
   lastUpdateDate: number;
   lastUpdateId: number;
+};
+
+export type LimitedReactionVibeInput = {
+  // The base delta includes positive changes and refunds, before a new charge.
+  entry: VibeLedgerInput & { actorUserId: string };
+  // The state contains retained charges, before an optional new charge.
+  state: ReactionVibeStateInput;
+  requestNegativeCharge: boolean;
 };
 
 export type ReservedUpdateProcessing = {
@@ -133,6 +143,9 @@ export type CommunityBotRepository = {
     messageId: number,
   ): Promise<TelegramUserProfile | null>;
   addVibeLedgerEntry(input: VibeLedgerInput): Promise<boolean>;
+  applyLimitedReactionVibe(
+    input: LimitedReactionVibeInput,
+  ): Promise<{ inserted: boolean; delta: number; negativeChargeApplied: boolean }>;
   getReactionVibeState(
     chatId: string,
     messageId: number,

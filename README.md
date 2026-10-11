@@ -30,6 +30,18 @@ and only bans regular members or restricted users who are still members.
 Identifiable self-reactions do not count. Moderation runs when new
 updates arrive; existing messages and completed bans are not rescanned.
 
+For identifiable reaction actors, negative reactions can deduct at most one
+vibe per actor/recipient pair in the same chat during a rolling 24-hour window.
+This also limits negative reaction announcements to one per pair per window,
+across all of the recipient's messages. Removing all of an actor's negative
+reactions from a charged message refunds its charged vibe but does not reset
+the window. Removing uncharged reactions gives no refund. The allowance is
+checked when the update is processed. It does not
+automatically charge reactions that remain active when the window expires.
+All active negative reactions still count toward message deletion, including
+reactions that did not deduct vibe. Anonymous aggregate reaction counts have
+no actor identity and retain their existing scoring and announcement behavior.
+
 ## Requirements
 
 - [Bun](https://bun.sh/) 1.3.11 or newer;
@@ -154,6 +166,15 @@ bun run webhook:set
 Production migrations, deploys, and webhook changes refuse dirty Git trees.
 Review `git status --short --branch` and commit the intended tree first. D1
 migrations are append-only SQL files in `drizzle/migrations`.
+
+The negative reaction limit requires migration `0007_negative_reaction_limits.sql`
+before deploying the updated Worker. It preserves scores and refunds for existing
+active reactions. It seeds pair windows from the latest negative reaction ledger
+delta. Legacy entries combine negative charges and positive reaction rollbacks,
+so a recent positive rollback can also consume the initial window. Pause update
+processing for the migration and deployment, and preserve pending updates. The
+old Worker does not maintain the new refundable-charge state. After a rollback,
+reconcile that state before deploying the updated Worker again.
 
 ## License
 

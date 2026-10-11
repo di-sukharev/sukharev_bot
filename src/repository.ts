@@ -24,6 +24,7 @@ import {
 const UPDATE_RESERVATION_STALE_AFTER_MS = 120_000;
 const REACTION_RESERVATION_STALE_AFTER_MS = 120_000;
 const MODERATION_RESERVATION_STALE_AFTER_MS = 120_000;
+const NEGATIVE_REACTION_LIMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 type D1RunResult = {
   meta?: {
@@ -250,12 +251,88 @@ export function createD1CommunityBotRepository(
       return didChange(result);
     },
 
+    async applyLimitedReactionVibe({ entry, state, requestNegativeCharge }) {
+      const timestamp = nowIso();
+      const cutoff = new Date(Date.parse(timestamp) - NEGATIVE_REACTION_LIMIT_WINDOW_MS).toISOString();
+      const chargeRequested = Number(requestNegativeCharge);
+      const chargeBindings = [
+        chargeRequested, state.chatId, state.actorId,
+        state.recipientUserId, entry.idempotencyKey,
+      ];
+      const chargeSql = `CASE WHEN ? AND EXISTS (
+        SELECT 1 FROM negative_reaction_limits
+        WHERE chat_id = ? AND actor_id = ? AND recipient_user_id = ?
+          AND idempotency_key = ?
+      ) THEN 1 ELSE 0 END`;
+
+      // D1 batches are transactions. Claiming the pair's allowance, writing the
+      // ledger, and recording refundable charges must succeed together.
+      // Zero-delta entries preserve denied decisions when Telegram retries.
+      const results = await database.batch<{ delta: number }>([
+        database.prepare(`
+          INSERT INTO negative_reaction_limits
+            (chat_id, actor_id, recipient_user_id, charged_at, idempotency_key)
+          SELECT ?, ?, ?, ?, ?
+          WHERE ? AND NOT EXISTS (
+            SELECT 1 FROM vibe_ledger WHERE idempotency_key = ?
+          )
+          ON CONFLICT (chat_id, actor_id, recipient_user_id) DO UPDATE SET
+            charged_at = excluded.charged_at,
+            idempotency_key = excluded.idempotency_key
+          WHERE negative_reaction_limits.charged_at <= ?
+        `).bind(
+          state.chatId, state.actorId, state.recipientUserId, timestamp,
+          entry.idempotencyKey, chargeRequested, entry.idempotencyKey, cutoff,
+        ),
+        database.prepare(`
+          INSERT OR IGNORE INTO vibe_ledger (
+            idempotency_key, chat_id, recipient_user_id, actor_user_id, delta,
+            source, reason, source_message_id, target_message_id, created_at
+          ) VALUES (?, ?, ?, ?, ? - ${chargeSql}, ?, ?, ?, ?, ?)
+          RETURNING delta
+        `).bind(
+          entry.idempotencyKey, entry.chatId, entry.recipientUserId,
+          entry.actorUserId, entry.delta, ...chargeBindings, entry.source,
+          entry.reason, entry.sourceMessageId, entry.targetMessageId, timestamp,
+        ),
+        database.prepare(`
+          INSERT INTO reaction_vibe_states (
+            chat_id, message_id, actor_id, recipient_user_id,
+            positive_reaction_count, poop_reaction_count,
+            charged_negative_reaction_count, last_update_date, last_update_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ? + ${chargeSql}, ?, ?, ?)
+          ON CONFLICT (chat_id, message_id, actor_id) DO UPDATE SET
+            recipient_user_id = excluded.recipient_user_id,
+            positive_reaction_count = excluded.positive_reaction_count,
+            poop_reaction_count = excluded.poop_reaction_count,
+            charged_negative_reaction_count = excluded.charged_negative_reaction_count,
+            last_update_date = excluded.last_update_date,
+            last_update_id = excluded.last_update_id,
+            updated_at = excluded.updated_at
+          WHERE reaction_vibe_states.last_update_id IS NULL
+            OR reaction_vibe_states.last_update_id <> excluded.last_update_id
+        `).bind(
+          state.chatId, state.messageId, state.actorId, state.recipientUserId,
+          state.positiveReactionCount, state.negativeReactionCount,
+          state.chargedNegativeReactionCount, ...chargeBindings,
+          state.lastUpdateDate, state.lastUpdateId, timestamp,
+        ),
+      ]);
+
+      return {
+        inserted: didChange(results[1]!),
+        delta: results[1]?.results[0]?.delta ?? 0,
+        negativeChargeApplied: didChange(results[0]!),
+      };
+    },
+
     async getReactionVibeState(chatId, messageId, actorId): Promise<ReactionVibeState> {
       const rows = await db
         .select({
           recipientUserId: reactionVibeStates.recipientUserId,
           positiveReactionCount: reactionVibeStates.positiveReactionCount,
           negativeReactionCount: reactionVibeStates.negativeReactionCount,
+          chargedNegativeReactionCount: reactionVibeStates.chargedNegativeReactionCount,
           lastUpdateDate: reactionVibeStates.lastUpdateDate,
           lastUpdateId: reactionVibeStates.lastUpdateId,
         })
@@ -273,6 +350,7 @@ export function createD1CommunityBotRepository(
         recipientUserId: rows[0]?.recipientUserId ?? null,
         positiveReactionCount: Number(rows[0]?.positiveReactionCount ?? 0),
         negativeReactionCount: Number(rows[0]?.negativeReactionCount ?? 0),
+        chargedNegativeReactionCount: Number(rows[0]?.chargedNegativeReactionCount ?? 0),
         lastUpdateDate:
           rows[0]?.lastUpdateDate === null || rows[0]?.lastUpdateDate === undefined
             ? null
@@ -348,6 +426,7 @@ export function createD1CommunityBotRepository(
           recipientUserId: input.recipientUserId,
           positiveReactionCount: input.positiveReactionCount,
           negativeReactionCount: input.negativeReactionCount,
+          chargedNegativeReactionCount: input.chargedNegativeReactionCount,
           lastUpdateDate: input.lastUpdateDate,
           lastUpdateId: input.lastUpdateId,
           updatedAt: nowIso(),
@@ -362,6 +441,7 @@ export function createD1CommunityBotRepository(
             recipientUserId: input.recipientUserId,
             positiveReactionCount: input.positiveReactionCount,
             negativeReactionCount: input.negativeReactionCount,
+            chargedNegativeReactionCount: input.chargedNegativeReactionCount,
             lastUpdateDate: input.lastUpdateDate,
             lastUpdateId: input.lastUpdateId,
             updatedAt: nowIso(),

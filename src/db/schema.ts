@@ -83,6 +83,9 @@ export const reactionVibeStates = sqliteTable(
     positiveReactionCount: integer("positive_reaction_count").notNull(),
     // SQL keeps the original poop-only column name; runtime treats it as all negative reactions.
     negativeReactionCount: integer("poop_reaction_count").notNull(),
+    chargedNegativeReactionCount: integer("charged_negative_reaction_count")
+      .notNull()
+      .default(0),
     lastUpdateDate: integer("last_update_date"),
     lastUpdateId: integer("last_update_id"),
     updatedAt: text("updated_at").notNull(),
@@ -90,6 +93,22 @@ export const reactionVibeStates = sqliteTable(
   (table) => ({
     primaryKey: primaryKey({
       columns: [table.chatId, table.messageId, table.actorId],
+    }),
+  }),
+);
+
+export const negativeReactionLimits = sqliteTable(
+  "negative_reaction_limits",
+  {
+    chatId: text("chat_id").notNull(),
+    actorId: text("actor_id").notNull(),
+    recipientUserId: text("recipient_user_id").notNull(),
+    chargedAt: text("charged_at").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+  },
+  (table) => ({
+    primaryKey: primaryKey({
+      columns: [table.chatId, table.actorId, table.recipientUserId],
     }),
   }),
 );

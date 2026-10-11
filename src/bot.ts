@@ -276,6 +276,7 @@ export function createCommunityBot(
           recipientUserId: recipient.id,
           positiveReactionCount: 0,
           negativeReactionCount: 0,
+          chargedNegativeReactionCount: 0,
           lastUpdateDate: reactionUpdate.date,
           lastUpdateId: ctx.update.update_id,
         });
@@ -287,7 +288,7 @@ export function createCommunityBot(
         negativeReactionCount: countNegativeReactions(reactionUpdate.new_reaction),
       };
       const deltas = getReactionStateDeltas(previousState, nextState);
-      const vibeDelta = getRecipientVibeDelta(
+      let vibeDelta = getRecipientVibeDelta(
         previousState,
         nextState,
         vibeRecipient?.id ?? null,
@@ -298,29 +299,63 @@ export function createCommunityBot(
         await ctx.repository.upsertUser(telegramUserToProfile(actorUser));
       }
 
-      const inserted = vibeDelta === 0 || !vibeRecipient
-        ? false
-        : await ctx.repository.addVibeLedgerEntry({
-            idempotencyKey: `reaction:${ctx.update.update_id}`,
-            chatId,
-            recipientUserId: vibeRecipient.id,
-            actorUserId: actorId,
-            delta: vibeDelta,
-            source: "message_reaction",
-            reason: "reaction vibe delta",
-            sourceMessageId: null,
-            targetMessageId: reactionUpdate.message_id,
-          });
-
-      await ctx.repository.setReactionVibeState({
+      const state = {
         chatId,
         messageId: reactionUpdate.message_id,
         actorId,
         recipientUserId: recipient?.id ?? UNKNOWN_MESSAGE_AUTHOR_ID,
         ...nextState,
+        chargedNegativeReactionCount: 0,
         lastUpdateDate: reactionUpdate.date,
         lastUpdateId: ctx.update.update_id,
-      });
+      };
+      let inserted = false;
+      let allowNegativeAnnouncement = true;
+      if (
+        vibeRecipient &&
+        (nextState.negativeReactionCount > 0 || previousState.negativeReactionCount > 0)
+      ) {
+        const sameRecipient = previousState.recipientUserId === null ||
+          previousState.recipientUserId === vibeRecipient.id;
+        const previousCharged = sameRecipient ? previousState.chargedNegativeReactionCount : 0;
+        const retainedCharges = Math.min(previousCharged, nextState.negativeReactionCount);
+        const result = await ctx.repository.applyLimitedReactionVibe({
+          entry: {
+            idempotencyKey: `reaction:${ctx.update.update_id}`,
+            chatId,
+            recipientUserId: vibeRecipient.id,
+            actorUserId: actorId,
+            delta: nextState.positiveReactionCount -
+              (sameRecipient ? previousState.positiveReactionCount : 0) +
+              previousCharged - retainedCharges,
+            source: "message_reaction",
+            reason: "reaction vibe delta",
+            sourceMessageId: null,
+            targetMessageId: reactionUpdate.message_id,
+          },
+          state: { ...state, chargedNegativeReactionCount: retainedCharges },
+          requestNegativeCharge: nextState.negativeReactionCount >
+            (sameRecipient ? previousState.negativeReactionCount : 0),
+        });
+        vibeDelta = result.delta;
+        inserted = result.inserted && vibeDelta !== 0;
+        allowNegativeAnnouncement = result.negativeChargeApplied;
+      } else {
+        inserted = vibeDelta === 0 || !vibeRecipient
+          ? false
+          : await ctx.repository.addVibeLedgerEntry({
+              idempotencyKey: `reaction:${ctx.update.update_id}`,
+              chatId,
+              recipientUserId: vibeRecipient.id,
+              actorUserId: actorId,
+              delta: vibeDelta,
+              source: "message_reaction",
+              reason: "reaction vibe delta",
+              sourceMessageId: null,
+              targetMessageId: reactionUpdate.message_id,
+            });
+        await ctx.repository.setReactionVibeState(state);
+      }
 
       const currentScore = inserted && vibeRecipient
         ? await ctx.repository.getVibeScore(chatId, vibeRecipient.id)
@@ -329,6 +364,7 @@ export function createCommunityBot(
       if (
         inserted &&
         vibeRecipient &&
+        (vibeDelta > 0 || allowNegativeAnnouncement) &&
         shouldAnnounceReactionDelta(ctx.config, deltas, vibeDelta)
       ) {
         const sentMessage = await ctx.api.sendMessage(
@@ -431,6 +467,7 @@ export function createCommunityBot(
         actorId: AGGREGATE_REACTION_ACTOR_ID,
         recipientUserId: recipient?.id ?? UNKNOWN_MESSAGE_AUTHOR_ID,
         ...nextState,
+        chargedNegativeReactionCount: 0,
         lastUpdateDate: reactionUpdate.date,
         lastUpdateId: ctx.update.update_id,
       });
