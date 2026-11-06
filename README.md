@@ -18,7 +18,9 @@ The project is distributed under the [Apache License 2.0](LICENSE).
 - permanently bans users at −10 vibe or below and requests deletion of all their
   messages in the same chat via Telegram's `revoke_messages` option;
 - provides `/chatid`, `/rules`, `/vibe`, and `/vibe_top` commands;
-- processes Telegram updates idempotently through D1 reservations.
+- records new subscribers of monitored channels, bans subscriber farm profiles,
+  and alerts the owner about a join burst;
+- processes community updates idempotently through D1 reservations.
 
 The bot is intentionally project-specific. Moderation thresholds, Russian copy,
 the profanity list, and the allowed main Telegram channel live in
@@ -107,7 +109,13 @@ Runtime variables belong in `wrangler.toml`:
 - `BOT_INFO` — Telegram `getMe` result object encoded as JSON;
 - `ANNOUNCE_REACTIONS` — whether reaction vibe changes are announced;
 - `WELCOME_MUTED_UNTIL` — optional ISO timestamp that pauses welcome messages;
-- `LINK_ALLOWED_USERNAMES` — usernames allowed to bypass link moderation.
+- `LINK_ALLOWED_USERNAMES` — usernames allowed to bypass link moderation;
+- `MONITORED_CHANNEL_IDS` — comma-separated channel IDs (`-100…`) watched by
+  the channel join monitor. Updates from these channels never reach community
+  features. The production preflight rejects other values and requires the
+  `CHANNEL_JOIN_QUEUE` and `CHANNEL_PROFILE_QUEUE` bindings with consumers;
+- `CHANNEL_ALERT_USER_ID` — Telegram user ID that receives join burst alerts.
+  The production preflight requires it when `MONITORED_CHANNEL_IDS` is set.
 
 Webhook setup additionally reads:
 
@@ -120,12 +128,15 @@ Never commit `.dev.vars` or the live `wrangler.toml`.
 
 ## Cloudflare setup
 
-Create one D1 database and one Queue, then copy the returned D1 ID and the chosen
-resource names into `wrangler.toml`:
+Create one D1 database and the Queues, then copy the returned D1 ID and the
+chosen resource names into `wrangler.toml`. The channel join monitor needs the
+two channel queues:
 
 ```bash
 bunx wrangler d1 create sukharev-community-bot
 bunx wrangler queues create sukharev-community-bot-vibe-notification-deletes
+bunx wrangler queues create sukharev-community-bot-channel-joins
+bunx wrangler queues create sukharev-community-bot-channel-profiles
 ```
 
 Set production secrets:
@@ -166,6 +177,77 @@ The setup script registers `message`, `edited_message`, `channel_post`,
 `message_reaction_count` updates with one Telegram connection. It refuses to
 mutate the webhook from a dirty Git tree.
 
+## Channel join monitor
+
+The bot protects each channel in `MONITORED_CHANNEL_IDS` against subscriber
+farms. Add the bot to the channel as an administrator with
+`can_restrict_members`. Telegram sends `chat_member` updates only after the bot
+becomes an administrator, so the monitor cannot see earlier subscribers.
+
+The webhook only puts each new subscription into `CHANNEL_JOIN_QUEUE`, so a
+join flood does not hold up the community chat on the shared single-connection
+webhook. The join queue consumer stores the joins, bans, checks profiles, and
+alerts. It handles one batch at a time and makes Telegram calls one by one, so
+bans stay within the Telegram rate limit. On a rate limit of up to 60 seconds,
+both channel consumers wait for the `retry_after` time of Telegram, repeat the
+call, and continue the batch. The wait uses no delivery attempt. On a longer
+rate limit, the affected message and the rest of the batch go back to the queue
+with a delay of `retry_after`.
+
+The ban rules come from the farm accounts of the flood on 2026-11-06. The bot
+bans a new subscriber at once when one of these rules matches:
+
+- the name contains a South Asian script (Indian scripts and Sinhala), the
+  Arabic script, or Chinese characters;
+- the username is 5 random letters, `_`, 5 random letters, and 3 digits
+  (`lozmn_egfrb932`), or 10 random letters and 3 digits (`zktkfncxqg547`);
+- the username is the first 5 letters of the last name and the first name, in
+  either order, optionally joined by `_`, and 3 digits (`ArnolVicen453` for
+  Vicenta Arnold);
+- the username is the Latin first name, an optional `_`, the Latin last name,
+  and 1–3 extra letters (`antoninaklimanovayp`, `antonina_klimanovayp`);
+- the subscriber has Telegram Premium, Latin first and last names of at least
+  3 letters each, and 3 digits at the end of the username.
+
+Other Premium subscribers with 3 digits at the end of the username wait as
+`checking` while the bot reads the profile with `getChat`. The bot bans them
+when the profile shows a photo, but no bio, personal channel, custom emoji
+status, or profile audio. In all rules, a username that ends with `123` does not
+count as 3 farm digits. `OWNER_USER_IDS` are never banned. The rules live in
+[`src/channel-join-rules.ts`](src/channel-join-rules.ts).
+
+Every subscription is stored in `channel_joins` with its Premium flag, language
+code, and outcome: `allowed`, `checking`, `banned`, or `ban_failed`. A due ban
+stays `ban_failed` until Telegram confirms it, also when Telegram rejects it or
+the queue gives up. After a join is handled, `CHANNEL_PROFILE_QUEUE` reads the
+profile of the subscriber and stores the profile flags (`has_bio`,
+`has_personal_chat`, `has_emoji_status`, `has_profile_audio`, `has_photo`) for
+later rule tuning. Profile lookups pause between calls and leave the Telegram
+rate limit to bans. A rejected lookup leaves the flags `NULL`.
+
+A burst is 50 or more joins within 2 seconds. A burst bans nobody. It sends a
+private alert to `CHANNEL_ALERT_USER_ID` at most once per 5 minutes per channel.
+The alert lists the subscribers of those 2 seconds that the bot recorded by the
+moment of the alert, with the bot's action for each. When the list exceeds one
+Telegram message, the alert shows its start and the number of other
+subscribers. The window uses Telegram update timestamps, so a queue backlog
+delays bans and alerts but does not change them.
+
+Telegram lets a bot message only users who started a private chat with it. The
+alert recipient must send `/start` to the bot once. Telegram rejections of a
+ban, a lookup, or an alert (400 or 403) are logged and do not stop the queue. A
+rejected alert still starts the cooldown. Other errors retry the join after 30
+seconds, up to 100 times, so a Telegram outage does not use up the retries.
+Profile lookups retry after 60 seconds. A redelivered join keeps its first row
+and continues from its stored outcome. A retried alert can arrive twice.
+
+List the subscribers of a monitored channel who joined after a given time. The
+query takes and shows Moscow time (UTC+3), the same time as the alert:
+
+```bash
+bunx wrangler d1 execute DB --remote --command "SELECT datetime(j.joined_at, 'unixepoch', '+3 hours') AS joined_at_msk, j.user_id, u.display_name, u.username, j.is_premium, j.language_code, j.outcome, j.has_bio, j.has_personal_chat, j.has_emoji_status, j.has_profile_audio, j.has_photo FROM channel_joins j JOIN telegram_users u ON u.id = j.user_id WHERE j.chat_id = '<channel id>' AND j.joined_at >= unixepoch('2026-11-06 12:45:00', '-3 hours') ORDER BY j.joined_at"
+```
+
 ## Development and release
 
 ```bash
@@ -203,6 +285,11 @@ Pause update processing and preserve pending Telegram updates while applying
 and cannot run against this schema. Prefer a forward fix. A rollback requires
 paused processing and a reviewed schema/data conversion before deploying the
 previous Worker. Resume the webhook only after deploying a compatible Worker.
+
+The channel join monitor requires migration `0010_channel_joins.sql` and the
+two channel queues before deploying its Worker. The migration only adds two
+tables and an index, so the previous Worker keeps working against it. The
+webhook already registers `chat_member` updates and needs no change.
 
 ## License
 

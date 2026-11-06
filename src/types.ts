@@ -1,4 +1,5 @@
 import type { Chat, User } from "grammy/types";
+import type { ChannelJoinJob, ChannelProfileJob } from "./channel-join-monitor";
 import type { VibeNotificationDeleteJob } from "./vibe-notification-delete";
 
 export type WorkerEnv = {
@@ -11,11 +12,16 @@ export type WorkerEnv = {
   ANNOUNCE_REACTIONS?: string;
   WELCOME_MUTED_UNTIL?: string;
   LINK_ALLOWED_USERNAMES?: string;
+  MONITORED_CHANNEL_IDS?: string;
+  CHANNEL_ALERT_USER_ID?: string;
   VIBE_NOTIFICATION_DELETE_QUEUE?: Queue<VibeNotificationDeleteJob>;
+  CHANNEL_JOIN_QUEUE?: Queue<ChannelJoinJob>;
+  CHANNEL_PROFILE_QUEUE?: Queue<ChannelProfileJob>;
 };
 
 export type RuntimeConfig = {
   allowedChatIds: Set<string>;
+  monitoredChannelIds: Set<string>;
   ownerUserIds: Set<string>;
   announceReactions: boolean;
   welcomeMutedUntilMs: number | null;
@@ -129,6 +135,48 @@ export type ModerationActionReservationResult =
   | { status: "completed" }
   | { status: "processing" };
 
+// A join waits as checking while the bot reads the profile, and as ban_failed
+// while a due ban is not confirmed by Telegram.
+export type ChannelJoinOutcome = "allowed" | "checking" | "banned" | "ban_failed";
+
+export type ChannelJoinInput = {
+  updateId: number;
+  chatId: string;
+  user: TelegramUserProfile;
+  isPremium: boolean;
+  languageCode: string | null;
+  // Telegram Unix time of the membership change.
+  joinedAt: number;
+  outcome: Exclude<ChannelJoinOutcome, "banned">;
+};
+
+// The joins after `after`, up to `until`, in Telegram Unix time.
+export type ChannelJoinWindow = {
+  after: number;
+  until: number;
+};
+
+export type ChannelJoinActivity = {
+  // The joins of each window, counted up to the limit.
+  joins: number[];
+  lastAlertAt: number | null;
+};
+
+export type ChannelJoinProfile = {
+  hasBio: boolean;
+  hasPersonalChat: boolean;
+  hasEmojiStatus: boolean;
+  hasProfileAudio: boolean;
+  hasPhoto: boolean;
+};
+
+export type ChannelJoinEntry = {
+  userId: string;
+  displayName: string;
+  username: string | null;
+  outcome: ChannelJoinOutcome;
+};
+
 export type CommunityBotRepository = {
   reserveUpdateProcessing(updateId: number): Promise<UpdateProcessingReservation>;
   markUpdateProcessed(reservation: ReservedUpdateProcessing): Promise<boolean>;
@@ -174,6 +222,22 @@ export type CommunityBotRepository = {
   ): Promise<void>;
   getVibeScore(chatId: string, userId: string): Promise<number>;
   getVibeTop(chatId: string, limit: number): Promise<VibeTopEntry[]>;
+};
+
+export type ChannelJoinRepository = {
+  // Stores new joins and returns the stored outcome of each join. A redelivered
+  // join keeps its first row.
+  recordChannelJoins(joins: readonly ChannelJoinInput[]): Promise<ChannelJoinOutcome[]>;
+  getChannelJoinActivity(
+    chatId: string,
+    windows: readonly ChannelJoinWindow[],
+    limit: number,
+  ): Promise<ChannelJoinActivity>;
+  setChannelJoinOutcome(updateId: number, outcome: ChannelJoinOutcome): Promise<void>;
+  saveChannelJoinProfile(updateId: number, profile: ChannelJoinProfile): Promise<void>;
+  // Lists the joins of the window in join order.
+  listChannelJoins(chatId: string, window: ChannelJoinWindow): Promise<ChannelJoinEntry[]>;
+  markChannelAlerted(chatId: string, alertedAt: number): Promise<void>;
 };
 
 export function telegramUserToProfile(user: User): TelegramUserProfile {

@@ -76,11 +76,11 @@ async function deleteTelegramMessageAfterDelay(
 }
 
 export async function processVibeNotificationDeleteQueue(
-  batch: MessageBatch<VibeNotificationDeleteJob>,
+  messages: readonly Message<VibeNotificationDeleteJob>[],
   env: TelegramDeleteMessageEnv,
   apiFetch: typeof fetch = fetch,
 ): Promise<void> {
-  for (const message of batch.messages) {
+  for (const message of messages) {
     await deleteTelegramMessage(env, message.body, apiFetch);
   }
 }

@@ -1,14 +1,24 @@
 import { readFileSync } from "node:fs";
 
+type WranglerConfig = {
+  vars?: Record<string, unknown>;
+  queues?: {
+    producers?: Array<{ binding?: unknown; queue?: unknown }>;
+    consumers?: Array<{ queue?: unknown }>;
+  };
+};
+
 type BotInfo = {
   id?: unknown;
   is_bot?: unknown;
   first_name?: unknown;
 };
 
-const wranglerToml = readFileSync("wrangler.toml", "utf8");
-const botInfo = readBotInfo(wranglerToml);
-const welcomeMutedUntil = readOptionalStringVar(wranglerToml, "WELCOME_MUTED_UNTIL");
+const config = Bun.TOML.parse(readFileSync("wrangler.toml", "utf8")) as WranglerConfig;
+const botInfo = readBotInfo(config);
+const welcomeMutedUntil = readOptionalStringVar(config, "WELCOME_MUTED_UNTIL");
+const monitoredChannelIds = readOptionalStringVar(config, "MONITORED_CHANNEL_IDS")?.trim();
+const channelAlertUserId = readOptionalStringVar(config, "CHANNEL_ALERT_USER_ID");
 
 if (
   typeof botInfo.id !== "number" ||
@@ -29,29 +39,44 @@ if (
   throw new Error("wrangler.toml WELCOME_MUTED_UNTIL must be an ISO timestamp");
 }
 
+if (
+  monitoredChannelIds &&
+  !monitoredChannelIds.split(",").every((id) => /^-100\d+$/u.test(id.trim()))
+) {
+  throw new Error(
+    "wrangler.toml MONITORED_CHANNEL_IDS must be comma-separated Telegram channel IDs that start with -100",
+  );
+}
+
+if (monitoredChannelIds && !/^\d+$/u.test(channelAlertUserId?.trim() ?? "")) {
+  throw new Error(
+    "wrangler.toml CHANNEL_ALERT_USER_ID must be a Telegram user ID when MONITORED_CHANNEL_IDS is set",
+  );
+}
+
+if (monitoredChannelIds) {
+  for (const binding of ["CHANNEL_JOIN_QUEUE", "CHANNEL_PROFILE_QUEUE"]) {
+    const queue = config.queues?.producers?.find((producer) => producer.binding === binding)?.queue;
+    if (!queue || !config.queues?.consumers?.some((consumer) => consumer.queue === queue)) {
+      throw new Error(
+        `wrangler.toml must bind ${binding} to a queue with a consumer when MONITORED_CHANNEL_IDS is set`,
+      );
+    }
+  }
+}
+
 console.log("Telegram bot production vars look valid.");
 
-function readBotInfo(toml: string): BotInfo {
-  const match = readStringVarMatch(toml, "BOT_INFO");
-  if (!match) {
+function readBotInfo(wrangler: WranglerConfig): BotInfo {
+  const botInfoJson = readOptionalStringVar(wrangler, "BOT_INFO");
+  if (botInfoJson === null) {
     throw new Error("wrangler.toml BOT_INFO var is required");
   }
 
-  const botInfoJson = JSON.parse(match[1] ?? "") as string;
   return JSON.parse(botInfoJson) as BotInfo;
 }
 
-function readOptionalStringVar(toml: string, name: string): string | null {
-  const match = readStringVarMatch(toml, name);
-  if (!match) {
-    return null;
-  }
-
-  return JSON.parse(match[1] ?? "") as string;
+function readOptionalStringVar(wrangler: WranglerConfig, name: string): string | null {
+  const value = wrangler.vars?.[name];
+  return typeof value === "string" ? value : null;
 }
-
-function readStringVarMatch(toml: string, name: string): RegExpMatchArray | null {
-  return toml.match(new RegExp(`^\\s*${name}\\s*=\\s*(\".*\")\\s*$`, "m"));
-}
-
-export {};

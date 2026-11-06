@@ -10,6 +10,8 @@ OWNER_USER_IDS = "123456789"
 ANNOUNCE_REACTIONS = "false"
 WELCOME_MUTED_UNTIL = ""
 LINK_ALLOWED_USERNAMES = "example_admin"
+MONITORED_CHANNEL_IDS = ""
+CHANNEL_ALERT_USER_ID = ""
 BOT_INFO = "{\"id\":0,\"is_bot\":true,\"first_name\":\"Community Bot\",\"username\":\"replace_me_bot\",\"can_join_groups\":true,\"can_read_all_group_messages\":true,\"supports_inline_queries\":false}"
 
 [[d1_databases]]
@@ -27,3 +29,31 @@ queue = "sukharev-community-bot-vibe-notification-deletes"
 max_batch_size = 10
 max_batch_timeout = 1
 max_retries = 3
+
+[[queues.producers]]
+binding = "CHANNEL_JOIN_QUEUE"
+queue = "sukharev-community-bot-channel-joins"
+
+[[queues.producers]]
+binding = "CHANNEL_PROFILE_QUEUE"
+queue = "sukharev-community-bot-channel-profiles"
+
+# Channel joins: one batch at a time keeps bans within the Telegram rate limit.
+# A failed join retries after 30 seconds, so a Telegram outage does not use up
+# its retries.
+[[queues.consumers]]
+queue = "sukharev-community-bot-channel-joins"
+max_batch_size = 50
+max_batch_timeout = 1
+max_retries = 100
+retry_delay = 30
+max_concurrency = 1
+
+# Profile lookups only collect data, so they run slowly in the background.
+[[queues.consumers]]
+queue = "sukharev-community-bot-channel-profiles"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 5
+retry_delay = 60
+max_concurrency = 1

@@ -1,3 +1,4 @@
+import type { ChannelJoinJob, ChannelProfileJob } from "../channel-join-monitor";
 import type {
   CommunityBotRepository,
   LimitedReactionVibeInput,
@@ -19,7 +20,12 @@ export function createTestEnv(
     ANNOUNCE_REACTIONS: string;
     WELCOME_MUTED_UNTIL: string;
     LINK_ALLOWED_USERNAMES: string;
+    DB: D1Database;
+    MONITORED_CHANNEL_IDS: string;
+    CHANNEL_ALERT_USER_ID: string;
     VIBE_NOTIFICATION_DELETE_QUEUE: Queue<unknown>;
+    CHANNEL_JOIN_QUEUE: Queue<ChannelJoinJob> | undefined;
+    CHANNEL_PROFILE_QUEUE: Queue<ChannelProfileJob>;
   }> = {},
 ) {
   return {
@@ -91,6 +97,34 @@ export function createQueueMock<Body>() {
   };
 
   return { messages, queue };
+}
+
+// A delivered queue batch. Each retried message reports its body and options.
+export function createQueueBatch<Body>(
+  bodies: readonly Body[],
+  onRetry: (body: Body, options?: QueueRetryOptions) => void = () => {},
+): MessageBatch<Body> {
+  return {
+    queue: "test-queue",
+    messages: bodies.map((body, index) => ({
+      id: `message-${index}`,
+      timestamp: new Date(0),
+      body,
+      attempts: 1,
+      ack() {},
+      retry(options?: QueueRetryOptions) {
+        onRetry(body, options);
+      },
+    })),
+    metadata: {
+      metrics: {
+        batchSize: bodies.length,
+        retries: 0,
+      } as unknown as MessageBatchMetrics,
+    },
+    ackAll() {},
+    retryAll() {},
+  };
 }
 
 export function installTelegramFetchMock() {

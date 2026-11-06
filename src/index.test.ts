@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import worker from "./index";
-import { createTestEnv, installTelegramFetchMock } from "./__tests__/helpers";
-import type { VibeNotificationDeleteJob } from "./vibe-notification-delete";
+import {
+  createQueueBatch,
+  createTestEnv,
+  installTelegramFetchMock,
+} from "./__tests__/helpers";
 
 describe("worker fetch handler", () => {
   test("returns health without bot secrets", async () => {
@@ -45,7 +48,7 @@ describe("worker fetch handler", () => {
 
     try {
       await worker.queue(
-        queueBatch([{ chatId: -1001, messageId: 42 }]),
+        createQueueBatch([{ chatId: -1001, messageId: 42 }]),
         createTestEnv(),
       );
     } finally {
@@ -76,7 +79,7 @@ describe("worker fetch handler", () => {
     try {
       await expect(
         worker.queue(
-          queueBatch([{ chatId: -1001, messageId: 42 }]),
+          createQueueBatch([{ chatId: -1001, messageId: 42 }]),
           createTestEnv(),
         ),
       ).resolves.toBeUndefined();
@@ -85,29 +88,3 @@ describe("worker fetch handler", () => {
     }
   });
 });
-
-function queueBatch(
-  jobs: readonly VibeNotificationDeleteJob[],
-): MessageBatch<VibeNotificationDeleteJob> {
-  return {
-    queue: "vibecoding-community-bot-prod-vibe-notification-deletes",
-    messages: jobs.map((body, index) => {
-      return {
-        id: `message-${index}`,
-        timestamp: new Date(0),
-        body,
-        attempts: 1,
-        ack() {},
-        retry() {},
-      };
-    }),
-    metadata: {
-      metrics: {
-        batchSize: jobs.length,
-        retries: 0,
-      } as unknown as MessageBatchMetrics,
-    },
-    ackAll() {},
-    retryAll() {},
-  };
-}

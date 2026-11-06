@@ -1,5 +1,6 @@
 import { Bot, Context, GrammyError } from "grammy";
 import type { Chat, Message, Update, User, UserFromGetMe } from "grammy/types";
+import { enqueueChannelJoin } from "./channel-join-monitor";
 import { createD1CommunityBotRepository } from "./repository";
 import type {
   CommunityBotRepository,
@@ -92,7 +93,26 @@ export function createCommunityBot(
     ctx.repository = repository;
     ctx.config = config;
     ctx.notificationDelete = notificationDelete;
+    await next();
+  });
 
+  // Monitored channels never reach community features, even when allowed. The
+  // webhook only queues their joins, so a join flood does not hold up the shared
+  // single-connection webhook. The queue stores joins idempotently, so the gate
+  // skips the update reservation.
+  bot.use(async (ctx, next) => {
+    const chat = getUpdateChat(ctx.update);
+    if (!chat || !config.monitoredChannelIds.has(String(chat.id))) {
+      await next();
+      return;
+    }
+
+    if (ctx.update.chat_member) {
+      await enqueueChannelJoin(env.CHANNEL_JOIN_QUEUE, ctx.update.update_id, ctx.update.chat_member);
+    }
+  });
+
+  bot.use(async (ctx, next) => {
     const reservation = await repository.reserveUpdateProcessing(ctx.update.update_id);
     if (reservation.status === "processed") {
       return;
@@ -534,6 +554,7 @@ export function createRuntimeConfig(
 ): RuntimeConfig {
   return {
     allowedChatIds: parseIdSet(env.ALLOWED_CHAT_IDS),
+    monitoredChannelIds: parseIdSet(env.MONITORED_CHANNEL_IDS),
     ownerUserIds: parseIdSet(env.OWNER_USER_IDS),
     announceReactions: parseBoolean(env.ANNOUNCE_REACTIONS),
     welcomeMutedUntilMs: parseOptionalTimestampMs(env.WELCOME_MUTED_UNTIL),

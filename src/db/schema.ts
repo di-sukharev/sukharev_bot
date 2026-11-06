@@ -126,6 +126,27 @@ export const reactionAwardReservations = sqliteTable(
   }),
 );
 
+export const channelJoins = sqliteTable("channel_joins", {
+  updateId: integer("update_id").primaryKey().notNull(),
+  chatId: text("chat_id").notNull(),
+  userId: text("user_id").notNull(),
+  joinedAt: integer("joined_at").notNull(),
+  isPremium: integer("is_premium", { mode: "boolean" }).notNull(),
+  languageCode: text("language_code"),
+  outcome: text("outcome", { enum: ["allowed", "checking", "banned", "ban_failed"] }).notNull(),
+  hasBio: integer("has_bio", { mode: "boolean" }),
+  hasPersonalChat: integer("has_personal_chat", { mode: "boolean" }),
+  hasEmojiStatus: integer("has_emoji_status", { mode: "boolean" }),
+  hasProfileAudio: integer("has_profile_audio", { mode: "boolean" }),
+  hasPhoto: integer("has_photo", { mode: "boolean" }),
+  createdAt: text("created_at").notNull(),
+});
+
+export const channelAlerts = sqliteTable("channel_alerts", {
+  chatId: text("chat_id").primaryKey().notNull(),
+  alertedAt: integer("alerted_at").notNull(),
+});
+
 export const moderationActions = sqliteTable("moderation_actions", {
   idempotencyKey: text("idempotency_key").primaryKey().notNull(),
   chatId: text("chat_id").notNull(),

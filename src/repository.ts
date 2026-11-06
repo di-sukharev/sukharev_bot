@@ -1,6 +1,9 @@
-import { and, desc, eq, lt, ne, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/d1";
+import { and, count, desc, eq, gt, lt, lte, ne, sql } from "drizzle-orm";
+import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import type {
+  ChannelJoinEntry,
+  ChannelJoinRepository,
+  ChannelJoinWindow,
   CommunityBotRepository,
   ModerationActionInput,
   ReactionVibeState,
@@ -11,6 +14,8 @@ import type {
   VibeTopEntry,
 } from "./types";
 import {
+  channelAlerts,
+  channelJoins,
   moderationActions,
   reactionAwardReservations,
   processedUpdates,
@@ -130,32 +135,7 @@ export function createD1CommunityBotRepository(
     },
 
     async upsertUser(user) {
-      const timestamp = nowIso();
-
-      await db
-        .insert(telegramUsers)
-        .values({
-          id: user.id,
-          username: user.username,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          displayName: user.displayName,
-          isBot: user.isBot,
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        })
-        .onConflictDoUpdate({
-          target: telegramUsers.id,
-          set: {
-            username: user.username,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            displayName: user.displayName,
-            isBot: user.isBot,
-            updatedAt: timestamp,
-          },
-        })
-        .run();
+      await upsertUserQuery(db, user, nowIso()).run();
     },
 
     async upsertChat(chat) {
@@ -592,4 +572,155 @@ export function createD1CommunityBotRepository(
       }));
     },
   };
+}
+
+export function createD1ChannelJoinRepository(
+  database: D1Database,
+): ChannelJoinRepository {
+  const db = drizzle(database);
+
+  return {
+    async recordChannelJoins(joins) {
+      if (joins.length === 0) {
+        return [];
+      }
+
+      const timestamp = nowIso();
+      const [firstUser, ...otherUsers] = joins.map((join) =>
+        upsertUserQuery(db, join.user, timestamp),
+      );
+      await db.batch([firstUser!, ...otherUsers]);
+
+      // A redelivered join keeps its row. The no-op update returns the stored outcome.
+      const [firstJoin, ...otherJoins] = joins.map((join) =>
+        db
+          .insert(channelJoins)
+          .values({
+            updateId: join.updateId,
+            chatId: join.chatId,
+            userId: join.user.id,
+            joinedAt: join.joinedAt,
+            isPremium: join.isPremium,
+            languageCode: join.languageCode,
+            outcome: join.outcome,
+            createdAt: timestamp,
+          })
+          .onConflictDoUpdate({
+            target: channelJoins.updateId,
+            set: { outcome: sql`${channelJoins.outcome}` },
+          })
+          .returning({ outcome: channelJoins.outcome }),
+      );
+      const stored = await db.batch([firstJoin!, ...otherJoins]);
+      return stored.map((rows) => rows[0]!.outcome);
+    },
+
+    async getChannelJoinActivity(chatId, windows, limit) {
+      const [alert, ...counts] = await db.batch([
+        db
+          .select({ alertedAt: channelAlerts.alertedAt })
+          .from(channelAlerts)
+          .where(eq(channelAlerts.chatId, chatId)),
+        ...windows.map((window) => countChannelJoinsQuery(db, chatId, window, limit)),
+      ]);
+
+      return {
+        joins: counts.map((rows) => rows[0]?.joins ?? 0),
+        lastAlertAt: alert[0]?.alertedAt ?? null,
+      };
+    },
+
+    async setChannelJoinOutcome(updateId, outcome) {
+      await db
+        .update(channelJoins)
+        .set({ outcome })
+        .where(eq(channelJoins.updateId, updateId))
+        .run();
+    },
+
+    async saveChannelJoinProfile(updateId, profile) {
+      await db
+        .update(channelJoins)
+        .set(profile)
+        .where(eq(channelJoins.updateId, updateId))
+        .run();
+    },
+
+    async listChannelJoins(chatId, window): Promise<ChannelJoinEntry[]> {
+      return db
+        .select({
+          userId: channelJoins.userId,
+          displayName: telegramUsers.displayName,
+          username: telegramUsers.username,
+          outcome: channelJoins.outcome,
+        })
+        .from(channelJoins)
+        .innerJoin(telegramUsers, eq(channelJoins.userId, telegramUsers.id))
+        .where(channelJoinsIn(chatId, window))
+        .orderBy(channelJoins.joinedAt, channelJoins.updateId);
+    },
+
+    async markChannelAlerted(chatId, alertedAt) {
+      await db
+        .insert(channelAlerts)
+        .values({ chatId, alertedAt })
+        .onConflictDoUpdate({ target: channelAlerts.chatId, set: { alertedAt } })
+        .run();
+    },
+  };
+}
+
+function channelJoinsIn(chatId: string, window: ChannelJoinWindow) {
+  return and(
+    eq(channelJoins.chatId, chatId),
+    gt(channelJoins.joinedAt, window.after),
+    lte(channelJoins.joinedAt, window.until),
+  );
+}
+
+function countChannelJoinsQuery(
+  db: DrizzleD1Database,
+  chatId: string,
+  window: ChannelJoinWindow,
+  limit: number,
+) {
+  // The limit bounds the rows that each count reads during a burst.
+  const windowJoins = db
+    .select({ updateId: channelJoins.updateId })
+    .from(channelJoins)
+    .where(channelJoinsIn(chatId, window))
+    .limit(limit)
+    .as("window_joins");
+
+  return db.select({ joins: count() }).from(windowJoins);
+}
+
+function upsertUserQuery(
+  db: DrizzleD1Database,
+  user: TelegramUserProfile,
+  timestamp: string,
+) {
+  return db
+    .insert(telegramUsers)
+    .values({
+      id: user.id,
+      username: user.username,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      displayName: user.displayName,
+      isBot: user.isBot,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    })
+    .onConflictDoUpdate({
+      target: telegramUsers.id,
+      set: {
+        username: user.username,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        displayName: user.displayName,
+        isBot: user.isBot,
+        updatedAt: timestamp,
+      },
+    });
 }
