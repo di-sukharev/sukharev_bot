@@ -18,7 +18,7 @@ const config = Bun.TOML.parse(readFileSync("wrangler.toml", "utf8")) as Wrangler
 const botInfo = readBotInfo(config);
 const welcomeMutedUntil = readOptionalStringVar(config, "WELCOME_MUTED_UNTIL");
 const monitoredChannelIds = readOptionalStringVar(config, "MONITORED_CHANNEL_IDS")?.trim();
-const channelAlertUserId = readOptionalStringVar(config, "CHANNEL_ALERT_USER_ID");
+const channelOperatorUserId = readOptionalStringVar(config, "CHANNEL_OPERATOR_USER_ID");
 
 if (
   typeof botInfo.id !== "number" ||
@@ -48,9 +48,9 @@ if (
   );
 }
 
-if (monitoredChannelIds && !/^\d+$/u.test(channelAlertUserId?.trim() ?? "")) {
+if (monitoredChannelIds && !/^\d+$/u.test(channelOperatorUserId?.trim() ?? "")) {
   throw new Error(
-    "wrangler.toml CHANNEL_ALERT_USER_ID must be a Telegram user ID when MONITORED_CHANNEL_IDS is set",
+    "wrangler.toml CHANNEL_OPERATOR_USER_ID must be a Telegram user ID when MONITORED_CHANNEL_IDS is set",
   );
 }
 

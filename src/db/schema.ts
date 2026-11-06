@@ -133,7 +133,10 @@ export const channelJoins = sqliteTable("channel_joins", {
   joinedAt: integer("joined_at").notNull(),
   isPremium: integer("is_premium", { mode: "boolean" }).notNull(),
   languageCode: text("language_code"),
-  outcome: text("outcome", { enum: ["allowed", "checking", "banned", "ban_failed"] }).notNull(),
+  outcome: text("outcome", {
+    enum: ["allowed", "checking", "banned", "ban_failed", "unbanned"],
+  }).notNull(),
+  bannedAt: integer("banned_at"),
   hasBio: integer("has_bio", { mode: "boolean" }),
   hasPersonalChat: integer("has_personal_chat", { mode: "boolean" }),
   hasEmojiStatus: integer("has_emoji_status", { mode: "boolean" }),
@@ -145,6 +148,16 @@ export const channelJoins = sqliteTable("channel_joins", {
 export const channelAlerts = sqliteTable("channel_alerts", {
   chatId: text("chat_id").primaryKey().notNull(),
   alertedAt: integer("alerted_at").notNull(),
+});
+
+export const channelBanPauses = sqliteTable("channel_ban_pauses", {
+  chatId: text("chat_id").primaryKey().notNull(),
+  createdAt: text("created_at").notNull(),
+});
+
+export const channelBanExemptions = sqliteTable("channel_ban_exemptions", {
+  userId: text("user_id").primaryKey().notNull(),
+  createdAt: text("created_at").notNull(),
 });
 
 export const moderationActions = sqliteTable("moderation_actions", {

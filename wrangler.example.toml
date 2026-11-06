@@ -11,7 +11,7 @@ ANNOUNCE_REACTIONS = "false"
 WELCOME_MUTED_UNTIL = ""
 LINK_ALLOWED_USERNAMES = "example_admin"
 MONITORED_CHANNEL_IDS = ""
-CHANNEL_ALERT_USER_ID = ""
+CHANNEL_OPERATOR_USER_ID = ""
 BOT_INFO = "{\"id\":0,\"is_bot\":true,\"first_name\":\"Community Bot\",\"username\":\"replace_me_bot\",\"can_join_groups\":true,\"can_read_all_group_messages\":true,\"supports_inline_queries\":false}"
 
 [[d1_databases]]

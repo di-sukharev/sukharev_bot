@@ -1,7 +1,8 @@
-import { and, count, desc, eq, gt, lt, lte, ne, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, lt, lte, ne, sql } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import type {
-  ChannelJoinEntry,
+  ChannelJoinOutcome,
+  ChannelJoinProfile,
   ChannelJoinRepository,
   ChannelJoinWindow,
   CommunityBotRepository,
@@ -15,6 +16,8 @@ import type {
 } from "./types";
 import {
   channelAlerts,
+  channelBanExemptions,
+  channelBanPauses,
   channelJoins,
   moderationActions,
   reactionAwardReservations,
@@ -39,6 +42,10 @@ type D1RunResult = {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function nowUnixSeconds(): number {
+  return Math.floor(Date.now() / 1000);
 }
 
 function didChange(result: D1RunResult): boolean {
@@ -638,6 +645,14 @@ export function createD1ChannelJoinRepository(
         .run();
     },
 
+    async markChannelJoinBanned(updateId) {
+      await db
+        .update(channelJoins)
+        .set({ outcome: "banned", bannedAt: nowUnixSeconds() })
+        .where(eq(channelJoins.updateId, updateId))
+        .run();
+    },
+
     async saveChannelJoinProfile(updateId, profile) {
       await db
         .update(channelJoins)
@@ -646,14 +661,9 @@ export function createD1ChannelJoinRepository(
         .run();
     },
 
-    async listChannelJoins(chatId, window): Promise<ChannelJoinEntry[]> {
+    async listChannelJoins(chatId, window) {
       return db
-        .select({
-          userId: channelJoins.userId,
-          displayName: telegramUsers.displayName,
-          username: telegramUsers.username,
-          outcome: channelJoins.outcome,
-        })
+        .select(channelJoinEntryFields)
         .from(channelJoins)
         .innerJoin(telegramUsers, eq(channelJoins.userId, telegramUsers.id))
         .where(channelJoinsIn(chatId, window))
@@ -667,7 +677,214 @@ export function createD1ChannelJoinRepository(
         .onConflictDoUpdate({ target: channelAlerts.chatId, set: { alertedAt } })
         .run();
     },
+
+    async getChannelBanPolicy(chatIds, userIds) {
+      const [pauses, exemptions] = await db.batch([
+        db
+          .select({ chatId: channelBanPauses.chatId })
+          .from(channelBanPauses)
+          .where(inArray(channelBanPauses.chatId, [...chatIds])),
+        db
+          .select({ userId: channelBanExemptions.userId })
+          .from(channelBanExemptions)
+          .where(inArray(channelBanExemptions.userId, [...userIds])),
+      ]);
+
+      return {
+        pausedChatIds: new Set(pauses.map(({ chatId }) => chatId)),
+        exemptUserIds: new Set(exemptions.map(({ userId }) => userId)),
+      };
+    },
+
+    async pauseChannelBans(chatIds) {
+      if (chatIds.length === 0) {
+        return;
+      }
+
+      // A repeated pause keeps the time of the first one.
+      const createdAt = nowIso();
+      await db
+        .insert(channelBanPauses)
+        .values(chatIds.map((chatId) => ({ chatId, createdAt })))
+        .onConflictDoNothing()
+        .run();
+    },
+
+    async resumeChannelBans(chatIds) {
+      await db.delete(channelBanPauses).where(inArray(channelBanPauses.chatId, [...chatIds])).run();
+    },
+
+    async exemptFromChannelBans(userId) {
+      await db
+        .insert(channelBanExemptions)
+        .values({ userId, createdAt: nowIso() })
+        .onConflictDoNothing()
+        .run();
+    },
+
+    async markChannelSubscriberUnbanned(chatId, userId) {
+      await db
+        .update(channelJoins)
+        .set({ outcome: "unbanned" })
+        .where(
+          and(
+            eq(channelJoins.chatId, chatId),
+            eq(channelJoins.userId, userId),
+            eq(channelJoins.outcome, "banned"),
+          ),
+        )
+        .run();
+    },
+
+    async listBannedChannelSubscribers(chatId, after) {
+      // A ban without a stored ban time counts by its join time.
+      const bannedAt = sql`coalesce(${channelJoins.bannedAt}, ${channelJoins.joinedAt})`;
+      const rows = await db
+        .select({ userId: channelJoins.userId })
+        .from(channelJoins)
+        .where(
+          and(
+            eq(channelJoins.chatId, chatId),
+            gt(bannedAt, after),
+            eq(channelJoins.outcome, "banned"),
+          ),
+        )
+        .groupBy(channelJoins.userId)
+        .orderBy(sql`min(${bannedAt})`);
+      return rows.map(({ userId }) => userId);
+    },
+
+    async getChannelJoinStats(chatId, after) {
+      const [rows, alert, pause] = await db.batch([
+        db
+          .select({ outcome: channelJoins.outcome, joins: count() })
+          .from(channelJoins)
+          .where(and(eq(channelJoins.chatId, chatId), gt(channelJoins.joinedAt, after)))
+          .groupBy(channelJoins.outcome),
+        db
+          .select({ alertedAt: channelAlerts.alertedAt })
+          .from(channelAlerts)
+          .where(eq(channelAlerts.chatId, chatId)),
+        db
+          .select({ createdAt: channelBanPauses.createdAt })
+          .from(channelBanPauses)
+          .where(eq(channelBanPauses.chatId, chatId)),
+      ]);
+
+      const outcomes: Record<ChannelJoinOutcome, number> = {
+        allowed: 0,
+        checking: 0,
+        banned: 0,
+        ban_failed: 0,
+        unbanned: 0,
+      };
+      for (const row of rows) {
+        outcomes[row.outcome] = row.joins;
+      }
+
+      return {
+        outcomes,
+        lastAlertAt: alert[0]?.alertedAt ?? null,
+        pausedAt: pause[0]?.createdAt ?? null,
+      };
+    },
+
+    async listRecentChannelJoins(chatId, limit) {
+      const rows = await db
+        .select(channelJoinEntryFields)
+        .from(channelJoins)
+        .innerJoin(telegramUsers, eq(channelJoins.userId, telegramUsers.id))
+        .where(eq(channelJoins.chatId, chatId))
+        .orderBy(desc(channelJoins.joinedAt), desc(channelJoins.updateId))
+        .limit(limit);
+      return rows.reverse();
+    },
+
+    async findUserIdByUsername(username) {
+      // A username can move to another account, so the latest owner wins.
+      const rows = await db
+        .select({ id: telegramUsers.id })
+        .from(telegramUsers)
+        .where(sql`lower(${telegramUsers.username}) = ${username.toLowerCase()}`)
+        .orderBy(desc(telegramUsers.updatedAt))
+        .limit(1);
+      return rows[0]?.id ?? null;
+    },
+
+    async getChannelSubscriber(userId, joinLimit) {
+      const [users, exemptions, joins] = await db.batch([
+        db
+          .select({
+            id: telegramUsers.id,
+            username: telegramUsers.username,
+            firstName: telegramUsers.firstName,
+            lastName: telegramUsers.lastName,
+            displayName: telegramUsers.displayName,
+            isBot: telegramUsers.isBot,
+          })
+          .from(telegramUsers)
+          .where(eq(telegramUsers.id, userId)),
+        db
+          .select({ createdAt: channelBanExemptions.createdAt })
+          .from(channelBanExemptions)
+          .where(eq(channelBanExemptions.userId, userId)),
+        db
+          .select({
+            chatId: channelJoins.chatId,
+            joinedAt: channelJoins.joinedAt,
+            isPremium: channelJoins.isPremium,
+            outcome: channelJoins.outcome,
+            hasBio: channelJoins.hasBio,
+            hasPersonalChat: channelJoins.hasPersonalChat,
+            hasEmojiStatus: channelJoins.hasEmojiStatus,
+            hasProfileAudio: channelJoins.hasProfileAudio,
+            hasPhoto: channelJoins.hasPhoto,
+          })
+          .from(channelJoins)
+          .where(eq(channelJoins.userId, userId))
+          .orderBy(desc(channelJoins.joinedAt), desc(channelJoins.updateId))
+          .limit(joinLimit),
+      ]);
+
+      return {
+        user: users[0] ?? null,
+        exemptSince: exemptions[0]?.createdAt ?? null,
+        joins: joins.map(({ chatId, joinedAt, isPremium, outcome, ...flags }) => ({
+          chatId,
+          joinedAt,
+          isPremium,
+          outcome,
+          profile: storedProfile(flags),
+        })),
+      };
+    },
   };
+}
+
+const channelJoinEntryFields = {
+  userId: channelJoins.userId,
+  displayName: telegramUsers.displayName,
+  username: telegramUsers.username,
+  outcome: channelJoins.outcome,
+  joinedAt: channelJoins.joinedAt,
+};
+
+// The profile lookup stores all flags at once, so one missing flag means no lookup.
+function storedProfile(flags: {
+  [Flag in keyof ChannelJoinProfile]: boolean | null;
+}): ChannelJoinProfile | null {
+  const { hasBio, hasPersonalChat, hasEmojiStatus, hasProfileAudio, hasPhoto } = flags;
+  if (
+    hasBio === null ||
+    hasPersonalChat === null ||
+    hasEmojiStatus === null ||
+    hasProfileAudio === null ||
+    hasPhoto === null
+  ) {
+    return null;
+  }
+
+  return { hasBio, hasPersonalChat, hasEmojiStatus, hasProfileAudio, hasPhoto };
 }
 
 function channelJoinsIn(chatId: string, window: ChannelJoinWindow) {

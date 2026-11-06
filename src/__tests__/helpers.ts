@@ -1,4 +1,4 @@
-import type { ChannelJoinJob, ChannelProfileJob } from "../channel-join-monitor";
+import type { ChannelJoinQueueJob, ChannelProfileJob } from "../channel-join-monitor";
 import type {
   CommunityBotRepository,
   LimitedReactionVibeInput,
@@ -22,9 +22,9 @@ export function createTestEnv(
     LINK_ALLOWED_USERNAMES: string;
     DB: D1Database;
     MONITORED_CHANNEL_IDS: string;
-    CHANNEL_ALERT_USER_ID: string;
+    CHANNEL_OPERATOR_USER_ID: string;
     VIBE_NOTIFICATION_DELETE_QUEUE: Queue<unknown>;
-    CHANNEL_JOIN_QUEUE: Queue<ChannelJoinJob> | undefined;
+    CHANNEL_JOIN_QUEUE: Queue<ChannelJoinQueueJob> | undefined;
     CHANNEL_PROFILE_QUEUE: Queue<ChannelProfileJob>;
   }> = {},
 ) {
@@ -75,7 +75,13 @@ export function createQueueMock<Body>() {
       };
     },
     async sendBatch(batch, options) {
-      for (const request of batch) {
+      // Cloudflare Queues rejects a larger batch.
+      const requests = [...batch];
+      if (requests.length > 100) {
+        throw new Error("Queue sendBatch takes at most 100 messages");
+      }
+
+      for (const request of requests) {
         messages.push({
           message: request.body,
           options: {

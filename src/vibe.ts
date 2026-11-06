@@ -614,6 +614,11 @@ export function parseIdSet(value: string | undefined): Set<string> {
   );
 }
 
+export function parseUserId(value: string | undefined): number | null {
+  const trimmed = value?.trim() ?? "";
+  return /^\d+$/u.test(trimmed) ? Number(trimmed) : null;
+}
+
 export function parseUsernameSet(value: string | undefined): Set<string> {
   return new Set(
     (value ?? "")

@@ -1,15 +1,11 @@
 import { webhookCallback } from "grammy";
 import { createCommunityBot } from "./bot";
-import {
-  type ChannelJoinJob,
-  type ChannelProfileJob,
-  createChannelJoinMonitor,
-} from "./channel-join-monitor";
+import { type ChannelJob, createChannelJoinMonitor } from "./channel-join-monitor";
 import { processVibeNotificationDeleteQueue } from "./vibe-notification-delete";
 import type { WorkerEnv } from "./types";
 import type { VibeNotificationDeleteJob } from "./vibe-notification-delete";
 
-type QueueJob = VibeNotificationDeleteJob | ChannelJoinJob | ChannelProfileJob;
+type QueueJob = VibeNotificationDeleteJob | ChannelJob;
 
 const WEBHOOK_PATH = "/telegram/webhook";
 
@@ -56,12 +52,9 @@ export default {
   },
 
   async queue(batch: MessageBatch<QueueJob>, env: WorkerEnv): Promise<void> {
-    const channelJoins = batch.messages.filter(isChannelJoinMessage);
-    const channelProfiles = batch.messages.filter(isChannelProfileMessage);
-    if (channelJoins.length > 0 || channelProfiles.length > 0) {
-      const monitor = createChannelJoinMonitor(env);
-      await monitor.processJoins(channelJoins);
-      await monitor.processProfiles(channelProfiles);
+    const channelJobs = batch.messages.filter(isChannelJobMessage);
+    if (channelJobs.length > 0) {
+      await createChannelJoinMonitor(env).process(channelJobs);
     }
 
     await processVibeNotificationDeleteQueue(
@@ -71,14 +64,9 @@ export default {
   },
 };
 
-function isChannelJoinMessage(message: Message<QueueJob>): message is Message<ChannelJoinJob> {
-  return "type" in message.body && message.body.type === "channel_join";
-}
-
-function isChannelProfileMessage(
-  message: Message<QueueJob>,
-): message is Message<ChannelProfileJob> {
-  return "type" in message.body && message.body.type === "channel_profile";
+// Only channel jobs carry a type.
+function isChannelJobMessage(message: Message<QueueJob>): message is Message<ChannelJob> {
+  return "type" in message.body;
 }
 
 function isVibeNotificationDeleteMessage(

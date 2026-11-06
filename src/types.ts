@@ -1,5 +1,5 @@
 import type { Chat, User } from "grammy/types";
-import type { ChannelJoinJob, ChannelProfileJob } from "./channel-join-monitor";
+import type { ChannelJoinQueueJob, ChannelProfileJob } from "./channel-join-monitor";
 import type { VibeNotificationDeleteJob } from "./vibe-notification-delete";
 
 export type WorkerEnv = {
@@ -13,15 +13,16 @@ export type WorkerEnv = {
   WELCOME_MUTED_UNTIL?: string;
   LINK_ALLOWED_USERNAMES?: string;
   MONITORED_CHANNEL_IDS?: string;
-  CHANNEL_ALERT_USER_ID?: string;
+  CHANNEL_OPERATOR_USER_ID?: string;
   VIBE_NOTIFICATION_DELETE_QUEUE?: Queue<VibeNotificationDeleteJob>;
-  CHANNEL_JOIN_QUEUE?: Queue<ChannelJoinJob>;
+  CHANNEL_JOIN_QUEUE?: Queue<ChannelJoinQueueJob>;
   CHANNEL_PROFILE_QUEUE?: Queue<ChannelProfileJob>;
 };
 
 export type RuntimeConfig = {
   allowedChatIds: Set<string>;
   monitoredChannelIds: Set<string>;
+  channelOperatorUserId: number | null;
   ownerUserIds: Set<string>;
   announceReactions: boolean;
   welcomeMutedUntilMs: number | null;
@@ -136,8 +137,9 @@ export type ModerationActionReservationResult =
   | { status: "processing" };
 
 // A join waits as checking while the bot reads the profile, and as ban_failed
-// while a due ban is not confirmed by Telegram.
-export type ChannelJoinOutcome = "allowed" | "checking" | "banned" | "ban_failed";
+// while a due ban is not confirmed by Telegram. A banned join becomes unbanned
+// when the operator unbans the subscriber.
+export type ChannelJoinOutcome = "allowed" | "checking" | "banned" | "ban_failed" | "unbanned";
 
 export type ChannelJoinInput = {
   updateId: number;
@@ -147,7 +149,7 @@ export type ChannelJoinInput = {
   languageCode: string | null;
   // Telegram Unix time of the membership change.
   joinedAt: number;
-  outcome: Exclude<ChannelJoinOutcome, "banned">;
+  outcome: Exclude<ChannelJoinOutcome, "banned" | "unbanned">;
 };
 
 // The joins after `after`, up to `until`, in Telegram Unix time.
@@ -175,6 +177,37 @@ export type ChannelJoinEntry = {
   displayName: string;
   username: string | null;
   outcome: ChannelJoinOutcome;
+  joinedAt: number;
+};
+
+// The operator's choices that spare subscribers from automatic bans.
+export type ChannelBanPolicy = {
+  pausedChatIds: Set<string>;
+  exemptUserIds: Set<string>;
+};
+
+export type ChannelJoinStats = {
+  outcomes: Record<ChannelJoinOutcome, number>;
+  lastAlertAt: number | null;
+  // When the operator paused bans in the channel, or null while bans run.
+  pausedAt: string | null;
+};
+
+export type ChannelSubscriberJoin = {
+  chatId: string;
+  joinedAt: number;
+  isPremium: boolean;
+  outcome: ChannelJoinOutcome;
+  // Null until the bot reads the profile.
+  profile: ChannelJoinProfile | null;
+};
+
+export type ChannelSubscriber = {
+  user: TelegramUserProfile | null;
+  // When the operator exempted the user from bans.
+  exemptSince: string | null;
+  // The latest joins, newest first.
+  joins: ChannelSubscriberJoin[];
 };
 
 export type CommunityBotRepository = {
@@ -233,11 +266,31 @@ export type ChannelJoinRepository = {
     windows: readonly ChannelJoinWindow[],
     limit: number,
   ): Promise<ChannelJoinActivity>;
-  setChannelJoinOutcome(updateId: number, outcome: ChannelJoinOutcome): Promise<void>;
+  // A confirmed ban goes through markChannelJoinBanned.
+  setChannelJoinOutcome(updateId: number, outcome: ChannelJoinInput["outcome"]): Promise<void>;
+  // Stores a confirmed ban with the Worker time as the ban time.
+  markChannelJoinBanned(updateId: number): Promise<void>;
   saveChannelJoinProfile(updateId: number, profile: ChannelJoinProfile): Promise<void>;
   // Lists the joins of the window in join order.
   listChannelJoins(chatId: string, window: ChannelJoinWindow): Promise<ChannelJoinEntry[]>;
   markChannelAlerted(chatId: string, alertedAt: number): Promise<void>;
+  getChannelBanPolicy(
+    chatIds: readonly string[],
+    userIds: readonly string[],
+  ): Promise<ChannelBanPolicy>;
+  pauseChannelBans(chatIds: readonly string[]): Promise<void>;
+  resumeChannelBans(chatIds: readonly string[]): Promise<void>;
+  exemptFromChannelBans(userId: string): Promise<void>;
+  // Marks the confirmed bans of the user in the channel as unbanned.
+  markChannelSubscriberUnbanned(chatId: string, userId: string): Promise<void>;
+  // Lists the users that the bot banned after the Unix time, in ban order.
+  listBannedChannelSubscribers(chatId: string, after: number): Promise<string[]>;
+  // Counts the joins after the time by outcome.
+  getChannelJoinStats(chatId: string, after: number): Promise<ChannelJoinStats>;
+  // Lists the latest joins in join order.
+  listRecentChannelJoins(chatId: string, limit: number): Promise<ChannelJoinEntry[]>;
+  findUserIdByUsername(username: string): Promise<string | null>;
+  getChannelSubscriber(userId: string, joinLimit: number): Promise<ChannelSubscriber>;
 };
 
 export function telegramUserToProfile(user: User): TelegramUserProfile {

@@ -19,7 +19,8 @@ The project is distributed under the [Apache License 2.0](LICENSE).
   messages in the same chat via Telegram's `revoke_messages` option;
 - provides `/chatid`, `/rules`, `/vibe`, and `/vibe_top` commands;
 - records new subscribers of monitored channels, bans subscriber farm profiles,
-  and alerts the owner about a join burst;
+  alerts the channel operator about a join burst, and gives the operator
+  private commands for stats, checks, unbans, and pauses;
 - processes community updates idempotently through D1 reservations.
 
 The bot is intentionally project-specific. Moderation thresholds, Russian copy,
@@ -114,8 +115,9 @@ Runtime variables belong in `wrangler.toml`:
   the channel join monitor. Updates from these channels never reach community
   features. The production preflight rejects other values and requires the
   `CHANNEL_JOIN_QUEUE` and `CHANNEL_PROFILE_QUEUE` bindings with consumers;
-- `CHANNEL_ALERT_USER_ID` — Telegram user ID that receives join burst alerts.
-  The production preflight requires it when `MONITORED_CHANNEL_IDS` is set.
+- `CHANNEL_OPERATOR_USER_ID` — Telegram user ID of the channel operator. The
+  operator receives join burst alerts and runs the channel commands. The
+  production preflight requires it when `MONITORED_CHANNEL_IDS` is set.
 
 Webhook setup additionally reads:
 
@@ -213,20 +215,25 @@ Other Premium subscribers with 3 digits at the end of the username wait as
 `checking` while the bot reads the profile with `getChat`. The bot bans them
 when the profile shows a photo, but no bio, personal channel, custom emoji
 status, or profile audio. In all rules, a username that ends with `123` does not
-count as 3 farm digits. `OWNER_USER_IDS` are never banned. The rules live in
+count as 3 farm digits. The rules live in
 [`src/channel-join-rules.ts`](src/channel-join-rules.ts).
 
+The bot never bans `OWNER_USER_IDS`, users that the operator exempted, or anyone
+in a channel where the operator paused bans. These joins are stored as
+`allowed`. A pause or an exemption also stops a ban that is still pending.
+
 Every subscription is stored in `channel_joins` with its Premium flag, language
-code, and outcome: `allowed`, `checking`, `banned`, or `ban_failed`. A due ban
-stays `ban_failed` until Telegram confirms it, also when Telegram rejects it or
-the queue gives up. After a join is handled, `CHANNEL_PROFILE_QUEUE` reads the
-profile of the subscriber and stores the profile flags (`has_bio`,
+code, and outcome: `allowed`, `checking`, `banned`, `ban_failed`, or
+`unbanned`. A due ban stays `ban_failed` until Telegram confirms it, also when
+Telegram rejects it or the queue gives up. A confirmed ban stores `banned_at`,
+the Worker time of the ban in Unix seconds. After a join is handled,
+`CHANNEL_PROFILE_QUEUE` reads the profile of the subscriber and stores the profile flags (`has_bio`,
 `has_personal_chat`, `has_emoji_status`, `has_profile_audio`, `has_photo`) for
 later rule tuning. Profile lookups pause between calls and leave the Telegram
 rate limit to bans. A rejected lookup leaves the flags `NULL`.
 
 A burst is 50 or more joins within 2 seconds. A burst bans nobody. It sends a
-private alert to `CHANNEL_ALERT_USER_ID` at most once per 5 minutes per channel.
+private alert to the operator at most once per 5 minutes per channel.
 The alert lists the subscribers of those 2 seconds that the bot recorded by the
 moment of the alert, with the bot's action for each. When the list exceeds one
 Telegram message, the alert shows its start and the number of other
@@ -234,12 +241,40 @@ subscribers. The window uses Telegram update timestamps, so a queue backlog
 delays bans and alerts but does not change them.
 
 Telegram lets a bot message only users who started a private chat with it. The
-alert recipient must send `/start` to the bot once. Telegram rejections of a
+operator must send `/start` to the bot once. Telegram rejections of a
 ban, a lookup, or an alert (400 or 403) are logged and do not stop the queue. A
 rejected alert still starts the cooldown. Other errors retry the join after 30
 seconds, up to 100 times, so a Telegram outage does not use up the retries.
 Profile lookups retry after 60 seconds. A redelivered join keeps its first row
 and continues from its stored outcome. A retried alert can arrive twice.
+
+### Operator commands
+
+The operator runs these commands in the private chat with the bot. The bot
+ignores them from other users and in other chats. Each command applies to all
+monitored channels.
+
+- `/start` adds the commands to the operator's command menu and lists them.
+- `/stats` counts the joins of the last 24 hours by outcome and shows the last
+  alert and the pause state.
+- `/recent` lists the last 20 joins.
+- `/check <user ID or @username>` shows the stored name, the rule that matches
+  the latest stored name and username, the latest joins with their profile
+  flags, and the exemption.
+- `/unban <user ID or @username>` exempts the user from bans and unbans the user
+  at once. The bot finds a username only among the users that it stored.
+- `/unban_hours <N>` puts the users that the bot banned in the last N hours, by
+  `banned_at`, into `CHANNEL_JOIN_QUEUE`. The join consumer unbans them one by
+  one and marks the joins `unbanned`. A bulk unban adds no exemptions, so the
+  rules ban these users again when they join again.
+- `/pause` and `/resume` stop and restart automatic bans. Alerts continue during
+  a pause.
+
+All unbans use `only_if_banned`, so an unban never removes a current member.
+Exemptions live in `channel_ban_exemptions` and pauses in `channel_ban_pauses`.
+No command removes an exemption. Delete its row in D1 if necessary.
+
+### Join listing
 
 List the subscribers of a monitored channel who joined after a given time. The
 query takes and shows Moscow time (UTC+3), the same time as the alert:
@@ -290,6 +325,19 @@ The channel join monitor requires migration `0010_channel_joins.sql` and the
 two channel queues before deploying its Worker. The migration only adds two
 tables and an index, so the previous Worker keeps working against it. The
 webhook already registers `chat_member` updates and needs no change.
+
+The operator commands require migration `0011_channel_operator.sql` before
+deploying their Worker. The migration rebuilds `channel_joins` to allow the
+`unbanned` outcome and to add `banned_at`, and keeps its rows. Bans before
+`0011` and bans by the previous Worker have no `banned_at`, so `/unban_hours`
+counts them by their join time. The migration also adds the exemption and
+pause tables. The Worker reads the operator from `CHANNEL_OPERATOR_USER_ID`,
+which replaces `CHANNEL_ALERT_USER_ID`.
+
+The previous Worker keeps working against `0011`, but it ignores pauses and
+exemptions and drops queued `channel_unban` jobs. Roll back with
+`wrangler rollback`, which keeps the previous version's `CHANNEL_ALERT_USER_ID`,
+instead of a redeploy of the previous commit.
 
 ## License
 

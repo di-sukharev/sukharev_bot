@@ -4,6 +4,14 @@ import type { ChannelJoinProfile } from "./types";
 // What the monitor does with a new subscriber before it reads the profile.
 export type SubscriberVerdict = "ban" | "check" | "allow";
 
+// The farm rule that a subscriber matches. A Premium farm username only asks
+// for a profile check.
+export type SubscriberRule =
+  | "foreign_script"
+  | "farm_username"
+  | "premium_latin_name"
+  | "premium_farm_username";
+
 // Usernames that the subscriber farm generated in the flood of 2026-11-06.
 const RANDOM_FARM_USERNAME = /^(?:[a-z]{5}_[a-z]{5}|[a-z]{10})\d{3}$/u;
 // Exactly 3 digits at the end of the username. People often pick 123.
@@ -21,22 +29,30 @@ const FOREIGN_SCRIPT = new RegExp(
 );
 
 export function classifySubscriber(user: User): SubscriberVerdict {
+  const rule = matchSubscriberRule(user);
+  return rule === null ? "allow" : rule === "premium_farm_username" ? "check" : "ban";
+}
+
+export function matchSubscriberRule(user: User): SubscriberRule | null {
   const username = user.username ?? "";
   const farmDigits = FARM_DIGITS.test(username);
+  if (FOREIGN_SCRIPT.test(`${user.first_name} ${user.last_name ?? ""}`)) {
+    return "foreign_script";
+  }
+
   if (
-    FOREIGN_SCRIPT.test(`${user.first_name} ${user.last_name ?? ""}`) ||
     isNameSuffixUsername(user, username) ||
     (farmDigits && (RANDOM_FARM_USERNAME.test(username) || isNameChunkUsername(user, username)))
   ) {
-    return "ban";
+    return "farm_username";
   }
 
   // The farm also uses Premium accounts with 3 digits at the end of the username.
   if (farmDigits && user.is_premium === true) {
-    return hasLatinNames(user) ? "ban" : "check";
+    return hasLatinNames(user) ? "premium_latin_name" : "premium_farm_username";
   }
 
-  return "allow";
+  return null;
 }
 
 // Premium farm profiles show a photo, but no bio, personal channel, custom emoji

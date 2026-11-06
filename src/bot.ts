@@ -1,6 +1,7 @@
 import { Bot, Context, GrammyError } from "grammy";
 import type { Chat, Message, Update, User, UserFromGetMe } from "grammy/types";
 import { enqueueChannelJoin } from "./channel-join-monitor";
+import { createChannelOperatorCommands } from "./channel-operator";
 import { createD1CommunityBotRepository } from "./repository";
 import type {
   CommunityBotRepository,
@@ -33,6 +34,7 @@ import {
   normalizeTelegramUsername,
   parseBoolean,
   parseIdSet,
+  parseUserId,
   parseUsernameSet,
   PROFANITY_WORDS,
 } from "./vibe";
@@ -130,6 +132,9 @@ export function createCommunityBot(
 
     await repository.markUpdateProcessed(reservation);
   });
+
+  // The operator's private chat is outside the allowed chats.
+  bot.use(createChannelOperatorCommands(env, config));
 
   bot.use(async (ctx, next) => {
     const chat = getUpdateChat(ctx.update);
@@ -555,6 +560,7 @@ export function createRuntimeConfig(
   return {
     allowedChatIds: parseIdSet(env.ALLOWED_CHAT_IDS),
     monitoredChannelIds: parseIdSet(env.MONITORED_CHANNEL_IDS),
+    channelOperatorUserId: parseUserId(env.CHANNEL_OPERATOR_USER_ID),
     ownerUserIds: parseIdSet(env.OWNER_USER_IDS),
     announceReactions: parseBoolean(env.ANNOUNCE_REACTIONS),
     welcomeMutedUntilMs: parseOptionalTimestampMs(env.WELCOME_MUTED_UNTIL),

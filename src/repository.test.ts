@@ -3,7 +3,7 @@ import type { Chat, Update } from "grammy/types";
 import { Miniflare } from "miniflare";
 import { createCommunityBot } from "./bot";
 import {
-  type ChannelJoinJob,
+  type ChannelJoinQueueJob,
   type ChannelProfileJob,
   createChannelJoinMonitor,
 } from "./channel-join-monitor";
@@ -30,7 +30,7 @@ let repository: CommunityBotRepository;
 beforeAll(async () => {
   miniflare = new Miniflare({
     compatibilityDate: "2026-06-02",
-    d1Databases: { DB: "moderation-test", LEGACY: "legacy-test" },
+    d1Databases: { DB: "moderation-test", LEGACY: "legacy-test", CHANNELS: "channels-test" },
     modules: true,
     script: "export default { fetch() { return new Response('ok'); } }",
   });
@@ -991,6 +991,28 @@ describe("D1 channel join monitor", () => {
     }
   });
 
+  test("routes queued unbans through the worker", async () => {
+    const channelId = -1129;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = telegram.fetch;
+    try {
+      await monitor.join({ userId: 1_129_001, date: 1000, profile: FARM_PROFILE });
+      await monitor.processJoins();
+      await monitor.command("/unban_hours 1");
+      await worker.queue(createQueueBatch(monitor.joinQueue.map(({ message }) => message)), monitor.env);
+
+      expect(unbanRequests(telegram.requests)).toEqual([
+        { chat_id: channelId, user_id: 1_129_001, only_if_banned: true },
+      ]);
+      expect(await channelJoinOutcomes(channelId)).toEqual({ unbanned: 1 });
+    } finally {
+      globalThis.fetch = originalFetch;
+      telegram.restore();
+    }
+  });
+
   test("ignores members who leave the channel", async () => {
     const channelId = -1117;
     const telegram = installTelegramFetchMock();
@@ -1085,14 +1107,458 @@ describe("D1 channel join monitor", () => {
       telegram.restore();
     }
   });
+
+  test("keeps stored joins when the migration adds the unbanned outcome and the ban time", async () => {
+    const channelDb = (await miniflare.getD1Database("CHANNELS")) as unknown as D1Database;
+    const migrations = Array.from(new Bun.Glob("*.sql").scanSync("drizzle/migrations")).sort();
+    for (const migration of migrations.filter(name => name < "0011_channel_operator.sql")) {
+      await applyMigration(channelDb, migration);
+    }
+    await channelDb.prepare(`INSERT INTO channel_joins (update_id, chat_id, user_id, joined_at, is_premium,
+      language_code, outcome, has_bio, has_personal_chat, has_emoji_status, has_profile_audio, has_photo, created_at)
+      VALUES (1, '-1001', '10', 1000, 1, 'en', 'banned', 0, 0, 0, 0, 1, '2026-11-06T12:45:00.000Z'),
+        (2, '-1001', '11', 1001, 0, NULL, 'allowed', NULL, NULL, NULL, NULL, NULL, '2026-11-06T12:45:01.000Z')`).run();
+    const stored = await channelDb.prepare("SELECT * FROM channel_joins ORDER BY update_id").all();
+
+    await applyMigration(channelDb, "0011_channel_operator.sql");
+    await channelDb.prepare("UPDATE channel_joins SET outcome = 'unbanned' WHERE update_id = 1").run();
+
+    // Earlier bans have no stored ban time.
+    expect((await channelDb.prepare("SELECT * FROM channel_joins ORDER BY update_id").all()).results).toEqual([
+      { ...stored.results[0], outcome: "unbanned", banned_at: null },
+      { ...stored.results[1], banned_at: null },
+    ]);
+  });
 });
 
-const CHANNEL_ALERT_USER_ID = 7991;
+describe("channel operator commands", () => {
+  test("answers only the operator in a private chat", async () => {
+    const channelId = -1131;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    try {
+      await monitor.command("/stats", { from: CHANNEL_OPERATOR_USER_ID + 1 });
+      await monitor.command("/pause", { from: CHANNEL_OPERATOR_USER_ID + 1 });
+      await monitor.command("/pause", { chat: COMMUNITY_CHAT });
+      expect(telegram.requests).toEqual([]);
+
+      await monitor.join({ userId: 1_131_001, date: 1000, profile: FARM_PROFILE });
+      await monitor.processJoins();
+      await monitor.command("/stats");
+
+      expect(bannedUserIds(telegram.requests)).toEqual([1_131_001]);
+      expect(operatorReplies(telegram.requests)).toHaveLength(1);
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("shows the operator menu on start", async () => {
+    const channelId = -1132;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    try {
+      await monitor.command("/start");
+
+      const menu = telegram.requests.find(request => request.url.endsWith("/setMyCommands"))?.body as {
+        commands: Array<{ command: string }>;
+        scope: unknown;
+      };
+      expect(menu.scope).toEqual({ type: "chat", chat_id: CHANNEL_OPERATOR_USER_ID });
+      expect(menu.commands.map(({ command }) => command)).toEqual([
+        "stats", "recent", "check", "unban", "unban_hours", "pause", "resume",
+      ]);
+      const replies = operatorReplies(telegram.requests);
+      expect(replies).toHaveLength(1);
+      for (const { command } of menu.commands) {
+        expect(replies[0]).toContain(`/${command} `);
+      }
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("pauses and resumes bans", async () => {
+    const channelId = -1133;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    try {
+      await monitor.command("/pause", { date: 1000 });
+      await monitor.join({ userId: 1_133_001, date: 1001, profile: FARM_PROFILE });
+      await monitor.processJoins();
+      await monitor.command("/resume", { date: 1002 });
+      await monitor.join({ userId: 1_133_002, date: 1003, profile: FARM_PROFILE });
+      await monitor.processJoins();
+
+      expect(bannedUserIds(telegram.requests)).toEqual([1_133_002]);
+      expect(await channelJoinOutcomes(channelId)).toEqual({ allowed: 1, banned: 1 });
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("alerts about a burst while bans pause", async () => {
+    const channelId = -1147;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    try {
+      await monitor.command("/pause", { date: 1000 });
+      const pauseRequests = telegram.requests.length;
+      for (let index = 0; index < 50; index += 1) {
+        await monitor.join({ userId: 1_147_000 + index, date: 1000, profile: FARM_PROFILE });
+      }
+      await monitor.processJoins();
+
+      expect(bannedUserIds(telegram.requests)).toEqual([]);
+      expect(alertRequests(telegram.requests.slice(pauseRequests))).toHaveLength(1);
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("allows a join that waits for a profile check when bans pause", async () => {
+    const channelId = -1142;
+    let lookupFails = true;
+    const telegram = installTelegramFetchMock();
+    const profiles = withProfiles(telegram.fetch, { 1_142_001: { photo: PROFILE_PHOTO } });
+    const monitor = createChannelMonitor(channelId, failingCalls("getChat", profiles,
+      () => lookupFails ? { error_code: 500, description: "Internal Server Error" } : null));
+    try {
+      await monitor.join({
+        userId: 1_142_001, date: 1000,
+        profile: { first_name: "Сыр", last_name: "Скуфов", username: "syrskufov_904", is_premium: true },
+      });
+      expect(await monitor.processJoins()).toStrictEqual([undefined]);
+      lookupFails = false;
+      await monitor.command("/pause", { date: 1001 });
+      expect(await monitor.processJoins()).toStrictEqual([]);
+      await monitor.processProfiles();
+
+      expect(bannedUserIds(telegram.requests)).toEqual([]);
+      expect(await storedJoins(channelId)).toEqual([{
+        user_id: "1142001", is_premium: 1, language_code: null, outcome: "allowed",
+        has_bio: 0, has_personal_chat: 0, has_emoji_status: 0, has_profile_audio: 0, has_photo: 1,
+      }]);
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("unbans a subscriber by username and spares them when they join again", async () => {
+    const channelId = -1134;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    const profile = { first_name: "Erin", last_name: "Barber", username: "qwertyuiop134" };
+    try {
+      await monitor.join({ userId: 1_134_001, date: 1000, profile });
+      await monitor.processJoins();
+      await monitor.command("/unban @QwertyUiop134");
+      await monitor.join({ userId: 1_134_001, updateId: 1_134_101, date: 1100, profile });
+      await monitor.processJoins();
+
+      expect(unbanRequests(telegram.requests)).toEqual([
+        { chat_id: channelId, user_id: 1_134_001, only_if_banned: true },
+      ]);
+      expect(bannedUserIds(telegram.requests)).toEqual([1_134_001]);
+      expect((await storedJoins(channelId)).map(join => join.outcome)).toEqual(["unbanned", "allowed"]);
+      expect(operatorReplies(telegram.requests)).toHaveLength(1);
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("stops a pending ban after an unban", async () => {
+    const channelId = -1135;
+    let banFails = true;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, failingCalls("banChatMember", telegram.fetch,
+      () => banFails ? { error_code: 500, description: "Internal Server Error" } : null));
+    try {
+      await monitor.join({ userId: 1_135_001, date: 1000, profile: FARM_PROFILE });
+      expect(await monitor.processJoins()).toStrictEqual([undefined]);
+      banFails = false;
+      await monitor.command("/unban 1135001");
+      expect(await monitor.processJoins()).toStrictEqual([]);
+
+      expect(bannedUserIds(telegram.requests)).toEqual([]);
+      expect(await channelJoinOutcomes(channelId)).toEqual({ allowed: 1 });
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test.each(["pause", "unban"] as const)("stops the remaining bans of a running join batch after /%s", async (action) => {
+    const channelId = action === "pause" ? -1143 : -1144;
+    const firstUserId = Math.abs(channelId) * 1000 + 1;
+    const secondUserId = firstUserId + 1;
+    const telegram = installTelegramFetchMock();
+    let operatorCommand: (() => Promise<void>) | null = null;
+    // The operator command arrives while the consumer bans the first subscriber.
+    const apiFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/banChatMember") && operatorCommand) {
+        const command = operatorCommand;
+        operatorCommand = null;
+        await command();
+      }
+      return telegram.fetch(input, init);
+    }) as typeof fetch;
+    const monitor = createChannelMonitor(channelId, apiFetch);
+    try {
+      await monitor.join({ userId: firstUserId, date: 1000, profile: FARM_PROFILE });
+      await monitor.join({ userId: secondUserId, date: 1001, profile: FARM_PROFILE });
+      operatorCommand = () => monitor.command(action === "pause" ? "/pause" : `/unban ${secondUserId}`);
+      await monitor.processJoins();
+
+      expect(bannedUserIds(telegram.requests)).toEqual([firstUserId]);
+      expect(await outcomesByUser(channelId)).toEqual({ [firstUserId]: "banned", [secondUserId]: "allowed" });
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test.each(["pause", "unban"] as const)("stops a checked ban that waits out a rate limit after /%s", async (action) => {
+    const channelId = action === "pause" ? -1148 : -1149;
+    const userId = Math.abs(channelId) * 1000 + 1;
+    const telegram = installTelegramFetchMock();
+    let operatorCommand: (() => Promise<void>) | null = null;
+    // The operator command arrives while the consumer waits out a rate limit on the ban.
+    const apiFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/banChatMember") && operatorCommand) {
+        const command = operatorCommand;
+        operatorCommand = null;
+        await command();
+        return Response.json({ ok: false, ...rateLimitError(1) });
+      }
+      return telegram.fetch(input, init);
+    }) as typeof fetch;
+    const monitor = createChannelMonitor(channelId, withProfiles(apiFetch, { [userId]: { photo: PROFILE_PHOTO } }));
+    try {
+      await monitor.join({
+        userId, date: 1000,
+        profile: { first_name: "Сыр", last_name: "Скуфов", username: "syrskufov_904", is_premium: true },
+      });
+      operatorCommand = () => monitor.command(action === "pause" ? "/pause" : `/unban ${userId}`);
+      expect(await monitor.processJoins()).toStrictEqual([]);
+
+      expect(bannedUserIds(telegram.requests)).toEqual([]);
+      // The consumer keeps the profile that it read and queues no second lookup.
+      expect(await storedJoins(channelId)).toEqual([{
+        user_id: String(userId), is_premium: 1, language_code: null, outcome: "allowed",
+        has_bio: 0, has_personal_chat: 0, has_emoji_status: 0, has_profile_audio: 0, has_photo: 1,
+      }]);
+      expect(monitor.profileQueue).toEqual([]);
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("unbans the bans of the last hours through the join queue", async () => {
+    const channelId = -1136;
+    const start = Date.UTC(2026, 10, 6, 12);
+    const startSeconds = start / 1000;
+    let banFails = false;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, failingCalls("banChatMember", telegram.fetch,
+      () => banFails ? { error_code: 500, description: "Internal Server Error" } : null));
+    setSystemTime(start);
+    try {
+      // Banned 3 hours before the command.
+      await monitor.join({ userId: 1_136_001, date: startSeconds, profile: FARM_PROFILE });
+      await monitor.join({ userId: 1_136_002, date: startSeconds + 1 });
+      await monitor.processJoins();
+      // Joined 3 hours before the command, banned 30 minutes before it.
+      banFails = true;
+      await monitor.join({ userId: 1_136_003, date: startSeconds + 2, profile: FARM_PROFILE });
+      await monitor.processJoins();
+      banFails = false;
+      setSystemTime(start + 150 * 60 * 1000);
+      await monitor.processJoins();
+      setSystemTime(start + 180 * 60 * 1000);
+      await monitor.command("/unban_hours 1", { date: startSeconds + 180 * 60 });
+      await monitor.processJoins();
+
+      expect(unbanRequests(telegram.requests)).toEqual([
+        { chat_id: channelId, user_id: 1_136_003, only_if_banned: true },
+      ]);
+      expect(await outcomesByUser(channelId)).toEqual({
+        1136001: "banned", 1136002: "allowed", 1136003: "unbanned",
+      });
+
+      // A bulk unban adds no exemption.
+      await monitor.join({ userId: 1_136_003, updateId: 1_136_103, date: startSeconds + 190 * 60, profile: FARM_PROFILE });
+      await monitor.processJoins();
+      expect(bannedUserIds(telegram.requests)).toEqual([1_136_001, 1_136_003, 1_136_003]);
+    } finally {
+      setSystemTime();
+      telegram.restore();
+    }
+  });
+
+  test("counts a ban without a stored ban time by the join time", async () => {
+    const channelId = -1146;
+    const start = Date.UTC(2026, 10, 6, 12);
+    const startSeconds = start / 1000;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    setSystemTime(start);
+    try {
+      await monitor.join({ userId: 1_146_001, date: startSeconds - 3 * 60 * 60, profile: FARM_PROFILE });
+      await monitor.join({ userId: 1_146_002, date: startSeconds, profile: FARM_PROFILE });
+      await monitor.processJoins();
+      // The previous Worker stores bans without the ban time.
+      await database.prepare("UPDATE channel_joins SET banned_at = NULL WHERE chat_id = ?")
+        .bind(String(channelId)).run();
+      setSystemTime(start + 30 * 60 * 1000);
+      await monitor.command("/unban_hours 1");
+      await monitor.processJoins();
+
+      expect(unbanRequests(telegram.requests)).toEqual([
+        { chat_id: channelId, user_id: 1_146_002, only_if_banned: true },
+      ]);
+      expect(await outcomesByUser(channelId)).toEqual({ 1146001: "banned", 1146002: "unbanned" });
+    } finally {
+      setSystemTime();
+      telegram.restore();
+    }
+  });
+
+  test("queues more than 100 unbans in batches that Cloudflare Queues accepts", async () => {
+    const channelId = -1145;
+    const userIds = Array.from({ length: 101 }, (_, index) => 1_145_000 + index);
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    try {
+      for (const [index, userId] of userIds.entries()) {
+        await monitor.join({ userId, date: 1000 + index, profile: FARM_PROFILE });
+        // The join consumer takes 50 messages at most.
+        if (index % 50 === 49) await monitor.processJoins();
+      }
+      await monitor.processJoins();
+      await monitor.command("/unban_hours 1");
+      await monitor.processJoins();
+
+      expect(unbanRequests(telegram.requests).map(request => (request as { user_id: number }).user_id))
+        .toEqual(userIds);
+      expect(await channelJoinOutcomes(channelId)).toEqual({ unbanned: 101 });
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("retries failed unbans and skips rejected ones", async () => {
+    const channelId = -1137;
+    let serverErrors = 1;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, failingCalls("unbanChatMember", telegram.fetch, (body) => {
+      if ((body as { user_id: number }).user_id === 1_137_001) {
+        return { error_code: 400, description: "Bad Request: PARTICIPANT_ID_INVALID" };
+      }
+      serverErrors -= 1;
+      return serverErrors >= 0 ? { error_code: 500, description: "Internal Server Error" } : null;
+    }));
+    try {
+      await monitor.join({ userId: 1_137_001, date: 1000, profile: FARM_PROFILE });
+      await monitor.join({ userId: 1_137_002, date: 1001, profile: FARM_PROFILE });
+      await monitor.processJoins();
+      await monitor.command("/unban_hours 1", { date: 2000 });
+
+      expect(await monitor.processJoins()).toStrictEqual([undefined]);
+      expect(await monitor.processJoins()).toStrictEqual([]);
+      expect(await outcomesByUser(channelId)).toEqual({ 1137001: "banned", 1137002: "unbanned" });
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("counts the joins of the last 24 hours", async () => {
+    const channelId = -1138;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    try {
+      await monitor.join({ userId: 1_138_001, date: 1000, profile: FARM_PROFILE });
+      await monitor.join({ userId: 1_138_002, date: 100_000, profile: FARM_PROFILE });
+      await monitor.join({ userId: 1_138_003, date: 100_001, profile: FARM_PROFILE });
+      await monitor.join({ userId: 1_138_004, date: 100_002 });
+      await monitor.processJoins();
+      await monitor.command("/stats", { date: 100_010 });
+
+      expect(outcomeCounts(operatorReplies(telegram.requests)[0]!)).toEqual({
+        "⛔": 2, "⚠️": 0, "⏳": 0, "↩️": 0, "•": 1,
+      });
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("lists the last 20 joins in join order", async () => {
+    const channelId = -1139;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    try {
+      await monitor.seed(22, 1000);
+      await monitor.processJoins();
+      await monitor.command("/recent", { date: 2000 });
+
+      const seeded = Array.from({ length: 22 }, (_, index) => 1139 * 10_000 + index);
+      expect(listedUserIds(operatorReplies(telegram.requests)[0]!)).toEqual(seeded.slice(2));
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("shows what the bot knows about a subscriber", async () => {
+    const channelId = -1140;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, withProfiles(telegram.fetch, {
+      1_140_001: { photo: PROFILE_PHOTO },
+    }));
+    try {
+      await monitor.join({
+        userId: 1_140_001, date: 1000,
+        profile: { first_name: "Hye", last_name: "Brownshaw", username: "hbrown_904", is_premium: true },
+      });
+      await monitor.processJoins();
+      await monitor.processProfiles();
+      await monitor.command("/check 1140001");
+      await monitor.command("/unban 1140001");
+      await monitor.command("/check 1140001");
+      await monitor.command("/check 1140999");
+
+      const [banned, , unbanned, unknown] = operatorReplies(telegram.requests);
+      expect(banned).toContain("1140001");
+      expect(banned).toContain("⛔");
+      expect(unbanned).toContain("↩️");
+      expect(unknown).toContain("1140999");
+    } finally {
+      telegram.restore();
+    }
+  });
+
+  test("answers invalid commands without side effects", async () => {
+    const channelId = -1141;
+    const telegram = installTelegramFetchMock();
+    const monitor = createChannelMonitor(channelId, telegram.fetch);
+    try {
+      for (const command of ["/unban", "/unban abc!", "/unban @nobody_seen_1141", "/check", "/unban_hours 0", "/unban_hours x"]) {
+        await monitor.command(command);
+      }
+
+      expect(operatorReplies(telegram.requests)).toHaveLength(6);
+      expect(unbanRequests(telegram.requests)).toEqual([]);
+      expect(monitor.joinQueue).toEqual([]);
+    } finally {
+      telegram.restore();
+    }
+  });
+});
+
+const CHANNEL_OPERATOR_USER_ID = 7991;
 const COMMUNITY_CHAT = { id: -1001, type: "supergroup", title: "Students" } as const;
 const PROFILE_PHOTO = {
   small_file_id: "small", small_file_unique_id: "small-unique",
   big_file_id: "big", big_file_unique_id: "big-unique",
 };
+const FARM_PROFILE = { first_name: "Erin", last_name: "Barber", username: "zktkfncxqg547" };
 
 type Profile = { first_name: string; last_name?: string; username?: string; is_premium?: true };
 // Fields that only the performer of the membership change carries.
@@ -1118,12 +1584,12 @@ function createChannelMonitor(
     failedProfileSends?: number;
   } = {},
 ) {
-  const joinQueue = createQueueMock<ChannelJoinJob>();
+  const joinQueue = createQueueMock<ChannelJoinQueueJob>();
   const profileQueue = createQueueMock<ChannelProfileJob>();
   const env = createTestEnv(options.allowedChatIds ?? "-1001", {
     DB: database,
     MONITORED_CHANNEL_IDS: String(channelId),
-    CHANNEL_ALERT_USER_ID: String(CHANNEL_ALERT_USER_ID),
+    CHANNEL_OPERATOR_USER_ID: String(CHANNEL_OPERATOR_USER_ID),
     OWNER_USER_IDS: options.ownerUserIds ?? "",
     CHANNEL_JOIN_QUEUE: options.withoutJoinQueue
       ? undefined
@@ -1133,6 +1599,7 @@ function createChannelMonitor(
   const bot = createCommunityBot(env, { repository, apiFetch });
   const monitor = createChannelJoinMonitor(env, { apiFetch, profileLookupPauseMs: 0 });
   let seeded = 0;
+  let commands = 0;
 
   async function join(joinOptions: JoinOptions) {
     await bot.handleUpdate(channelMemberUpdate(joinOptions.updateId ?? joinOptions.userId, { channelId, ...joinOptions }));
@@ -1144,6 +1611,16 @@ function createChannelMonitor(
     joinQueue: joinQueue.messages,
     profileQueue: profileQueue.messages,
     join,
+    // Sends a command to the bot, by default from the operator in a private chat.
+    async command(text: string, commandOptions: { from?: number; chat?: Chat; date?: number } = {}) {
+      const from = commandOptions.from ?? CHANNEL_OPERATOR_USER_ID;
+      commands += 1;
+      await bot.handleUpdate(commandUpdate(Math.abs(channelId) * 1000 + 900 + commands, text, {
+        from,
+        chat: commandOptions.chat ?? { id: from, type: "private", first_name: "Operator" },
+        date: commandOptions.date ?? 1000,
+      }));
+    },
     // Seeds ordinary subscribers. The default pace stays below the join burst limit.
     async seed(count: number, firstDate: number, joinsPerSecond = 5) {
       for (let offset = 0; offset < count; offset += 1) {
@@ -1152,8 +1629,8 @@ function createChannelMonitor(
         await join({ userId, date: firstDate + Math.floor(offset / joinsPerSecond) });
       }
     },
-    processJoins: () => deliver(joinQueue.messages, messages => monitor.processJoins(messages)),
-    processProfiles: () => deliver(profileQueue.messages, messages => monitor.processProfiles(messages)),
+    processJoins: () => deliver(joinQueue.messages, messages => monitor.process(messages)),
+    processProfiles: () => deliver(profileQueue.messages, messages => monitor.process(messages)),
   };
 }
 
@@ -1224,9 +1701,13 @@ function rateLimitError(retryAfter: number) {
 }
 
 // Answers the method with the returned Telegram error, or passes the call on when it returns null.
-function failingCalls(method: string, apiFetch: typeof fetch, callError: () => object | null): typeof fetch {
+function failingCalls(
+  method: string,
+  apiFetch: typeof fetch,
+  callError: (body: unknown) => object | null,
+): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const error = String(input).endsWith(`/${method}`) ? callError() : null;
+    const error = String(input).endsWith(`/${method}`) ? callError(JSON.parse(String(init?.body))) : null;
     return error ? Response.json({ ok: false, ...error }) : apiFetch(input, init);
   }) as typeof fetch;
 }
@@ -1252,13 +1733,51 @@ async function storedJoins(channelId: number) {
 
 function alertRequests(requests: Array<{ url: string; body: unknown }>) {
   return requests.filter(request => request.url.endsWith("/sendMessage") &&
-    (request.body as { chat_id: number }).chat_id === CHANNEL_ALERT_USER_ID);
+    (request.body as { chat_id: number }).chat_id === CHANNEL_OPERATOR_USER_ID);
 }
 
 function bannedUserIds(requests: Array<{ url: string; body: unknown }>): number[] {
   return requests
     .filter(request => request.url.endsWith("/banChatMember"))
     .map(request => (request.body as { user_id: number }).user_id);
+}
+
+function unbanRequests(requests: Array<{ url: string; body: unknown }>): unknown[] {
+  return requests.filter(request => request.url.endsWith("/unbanChatMember")).map(request => request.body);
+}
+
+function operatorReplies(requests: Array<{ url: string; body: unknown }>): string[] {
+  return alertRequests(requests).map(request => (request.body as { text: string }).text);
+}
+
+async function outcomesByUser(channelId: number): Promise<Record<string, unknown>> {
+  return Object.fromEntries((await storedJoins(channelId)).map(join => [join.user_id, join.outcome]));
+}
+
+// Reads the count after each outcome mark: "⛔ Забанены: 2".
+function outcomeCounts(text: string): Record<string, number> {
+  return Object.fromEntries(
+    [...text.matchAll(/^(\S+) [^:\n]+: (\d+)$/gmu)].map(([, mark, count]) => [mark, Number(count)]),
+  );
+}
+
+// Reads the user ID at the end of each listed join: "• Имя @ник · 123".
+function listedUserIds(text: string): number[] {
+  return [...text.matchAll(/ · (\d+)$/gmu)].map(([, userId]) => Number(userId));
+}
+
+function commandUpdate(updateId: number, text: string, options: { from: number; chat: Chat; date: number }): Update {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: updateId,
+      date: options.date,
+      chat: options.chat,
+      from: { id: options.from, is_bot: false, first_name: "Operator" },
+      text,
+      entities: [{ type: "bot_command", offset: 0, length: text.split(" ")[0]!.length }],
+    } as Update["message"],
+  };
 }
 
 function channelMemberUpdate(updateId: number, options: JoinOptions & { channelId: number }): Update {

@@ -5,8 +5,15 @@ import {
   isFarmProfile,
   readSubscriberProfile,
 } from "./channel-join-rules";
+import {
+  fitMessage,
+  formatMoscowTime,
+  formatSubscriber,
+  OUTCOME_MARKS,
+} from "./channel-join-text";
 import { createD1ChannelJoinRepository } from "./repository";
 import {
+  type ChannelBanPolicy,
   type ChannelJoinEntry,
   type ChannelJoinInput,
   type ChannelJoinOutcome,
@@ -17,7 +24,7 @@ import {
   telegramUserToProfile,
   type WorkerEnv,
 } from "./types";
-import { parseIdSet } from "./vibe";
+import { parseIdSet, parseUserId } from "./vibe";
 
 export type ChannelJoinJob = {
   type: "channel_join";
@@ -35,6 +42,17 @@ export type ChannelProfileJob = {
   userId: number;
 };
 
+// The operator's bulk unban. It shares the join queue, so one consumer makes
+// the ban and unban calls of the channels.
+export type ChannelUnbanJob = {
+  type: "channel_unban";
+  chatId: number;
+  userId: number;
+};
+
+export type ChannelJoinQueueJob = ChannelJoinJob | ChannelUnbanJob;
+export type ChannelJob = ChannelJoinQueueJob | ChannelProfileJob;
+
 export type ChannelJoinMonitorOptions = {
   apiFetch?: typeof fetch;
   profileLookupPauseMs?: number;
@@ -50,29 +68,14 @@ const PROFILE_LOOKUP_PAUSE_MS = 200;
 // A consumer waits out a shorter Telegram rate limit, so the wait uses no
 // delivery attempt. A longer one sends the message back to the queue.
 const MAX_RATE_LIMIT_WAIT_SECONDS = 60;
-
-const TELEGRAM_MESSAGE_LIMIT = 4096;
-const OUTCOME_MARKS: Record<ChannelJoinOutcome, string> = {
-  allowed: "•",
-  checking: "⏳",
-  banned: "⛔",
-  ban_failed: "⚠️",
-};
-
-const MOSCOW_TIME = new Intl.DateTimeFormat("ru-RU", {
-  timeZone: "Europe/Moscow",
-  day: "2-digit",
-  month: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-});
+// The most messages that one Cloudflare Queues sendBatch call takes.
+const QUEUE_SEND_BATCH_LIMIT = 100;
 
 type MonitorDeps = {
   repository: ChannelJoinRepository;
   api: Api;
   ownerUserIds: Set<string>;
-  alertUserId: string | null;
+  operatorUserId: number | null;
   profileQueue: Queue<ChannelProfileJob> | undefined;
   profileLookupPauseMs: number;
 };
@@ -88,7 +91,7 @@ type Retries = Map<Message<ChannelJoinJob>, QueueRetryOptions | undefined>;
 
 // Runs in the webhook. The queue keeps the work off the shared webhook.
 export async function enqueueChannelJoin(
-  queue: Queue<ChannelJoinJob> | undefined,
+  queue: Queue<ChannelJoinQueueJob> | undefined,
   updateId: number,
   update: ChatMemberUpdated,
 ): Promise<void> {
@@ -115,6 +118,21 @@ export async function enqueueChannelJoin(
   });
 }
 
+// Runs in the webhook. Splits the unbans into batches that the queue accepts.
+export async function enqueueChannelUnbans(
+  queue: Queue<ChannelJoinQueueJob>,
+  chatId: number,
+  userIds: readonly number[],
+): Promise<void> {
+  for (let start = 0; start < userIds.length; start += QUEUE_SEND_BATCH_LIMIT) {
+    await queue.sendBatch(
+      userIds.slice(start, start + QUEUE_SEND_BATCH_LIMIT).map((userId) => ({
+        body: { type: "channel_unban", chatId, userId },
+      })),
+    );
+  }
+}
+
 export function createChannelJoinMonitor(
   env: WorkerEnv,
   options: ChannelJoinMonitorOptions = {},
@@ -123,16 +141,24 @@ export function createChannelJoinMonitor(
     repository: createD1ChannelJoinRepository(env.DB),
     api: new Api(env.BOT_TOKEN, { fetch: options.apiFetch ?? fetch }),
     ownerUserIds: parseIdSet(env.OWNER_USER_IDS),
-    alertUserId: env.CHANNEL_ALERT_USER_ID?.trim() || null,
+    operatorUserId: parseUserId(env.CHANNEL_OPERATOR_USER_ID),
     profileQueue: env.CHANNEL_PROFILE_QUEUE,
     profileLookupPauseMs: options.profileLookupPauseMs ?? PROFILE_LOOKUP_PAUSE_MS,
   };
 
   return {
-    processJoins: (messages: readonly Message<ChannelJoinJob>[]) => processJoins(messages, deps),
-    processProfiles: (messages: readonly Message<ChannelProfileJob>[]) =>
-      processProfiles(messages, deps),
+    // Handles a batch of the join queue or the profile queue.
+    async process(messages: readonly Message<ChannelJob>[]): Promise<void> {
+      await processJoins(messages.filter(hasJobType("channel_join")), deps);
+      await processUnbans(messages.filter(hasJobType("channel_unban")), deps);
+      await processProfiles(messages.filter(hasJobType("channel_profile")), deps);
+    },
   };
+}
+
+function hasJobType<Type extends ChannelJob["type"]>(type: Type) {
+  return (message: Message<ChannelJob>): message is Message<Extract<ChannelJob, { type: Type }>> =>
+    message.body.type === type;
 }
 
 function isSubscription(update: ChatMemberUpdated): boolean {
@@ -158,8 +184,14 @@ async function processJoins(
   }
 
   // A failed write throws, so the queue delivers the whole batch again.
+  const jobs = messages.map(({ body }) => body);
+  // The policy at the start of the batch sets the stored outcomes and the alert.
+  const policy = await deps.repository.getChannelBanPolicy(
+    [...new Set(jobs.map((job) => String(job.chatId)))],
+    [...new Set(jobs.map((job) => String(job.user.id)))],
+  );
   const outcomes = await deps.repository.recordChannelJoins(
-    messages.map(({ body }) => joinInput(body, deps)),
+    jobs.map((job) => joinInput(job, isSpared(job, policy, deps))),
   );
   const joins = messages.map((message, index): RecordedJoin => ({
     message,
@@ -182,7 +214,13 @@ async function processJoins(
     }
 
     try {
-      await settleJoin(join, deps);
+      // The operator can pause bans or exempt the user while the batch runs.
+      if (await isSparedNow(join.job, deps)) {
+        await deps.repository.setChannelJoinOutcome(join.job.updateId, "allowed");
+        join.outcome = "allowed";
+      } else {
+        await settleJoin(join, deps);
+      }
     } catch (error) {
       console.error("A channel join action failed and goes back to the queue", {
         updateId: join.job.updateId,
@@ -194,7 +232,7 @@ async function processJoins(
   }
 
   for (const chatJoins of Map.groupBy(joins, (join) => join.job.chatId).values()) {
-    await alertBurst(chatJoins, deps, retries);
+    await alertBurst(chatJoins, policy, deps, retries);
   }
 
   await enqueueProfileLookups(
@@ -212,7 +250,7 @@ async function processJoins(
   }
 }
 
-function joinInput(job: ChannelJoinJob, deps: MonitorDeps): ChannelJoinInput {
+function joinInput(job: ChannelJoinJob, spared: boolean): ChannelJoinInput {
   return {
     updateId: job.updateId,
     chatId: String(job.chatId),
@@ -220,16 +258,32 @@ function joinInput(job: ChannelJoinJob, deps: MonitorDeps): ChannelJoinInput {
     isPremium: job.user.is_premium === true,
     languageCode: job.user.language_code ?? null,
     joinedAt: job.date,
-    outcome: initialOutcome(job.user, deps),
+    outcome: spared ? "allowed" : initialOutcome(job.user),
   };
 }
 
-// A due ban stays ban_failed until Telegram confirms it.
-function initialOutcome(user: User, deps: MonitorDeps): ChannelJoinInput["outcome"] {
-  if (deps.ownerUserIds.has(String(user.id))) {
-    return "allowed";
-  }
+// The bot bans no owner, no user that the operator exempted, and nobody in a
+// channel where the operator paused bans.
+function isSpared(job: ChannelJoinJob, policy: ChannelBanPolicy, deps: MonitorDeps): boolean {
+  const userId = String(job.user.id);
+  return (
+    deps.ownerUserIds.has(userId) ||
+    policy.exemptUserIds.has(userId) ||
+    policy.pausedChatIds.has(String(job.chatId))
+  );
+}
 
+// Reads the policy that the operator can change while the consumer runs.
+async function isSparedNow(job: ChannelJoinJob, deps: MonitorDeps): Promise<boolean> {
+  const policy = await deps.repository.getChannelBanPolicy(
+    [String(job.chatId)],
+    [String(job.user.id)],
+  );
+  return isSpared(job, policy, deps);
+}
+
+// A due ban stays ban_failed until Telegram confirms it.
+function initialOutcome(user: User): ChannelJoinInput["outcome"] {
   const verdict = classifySubscriber(user);
   return verdict === "ban" ? "ban_failed" : verdict === "check" ? "checking" : "allowed";
 }
@@ -249,8 +303,17 @@ async function settleJoin(join: RecordedJoin, deps: MonitorDeps): Promise<void> 
     await deps.repository.setChannelJoinOutcome(job.updateId, "ban_failed");
   }
 
+  // Each attempt reads the policy again, so a pause or an exemption during the
+  // profile lookup or a rate limit wait stops the ban.
+  let banned: boolean;
   try {
-    await callTelegram(() => deps.api.banChatMember(job.chatId, job.user.id));
+    banned = await callTelegram(async () => {
+      if (await isSparedNow(job, deps)) {
+        return false;
+      }
+      await deps.api.banChatMember(job.chatId, job.user.id);
+      return true;
+    });
   } catch (error) {
     // A rejected ban stays ban_failed. Other errors retry the join.
     if (isRejection(error)) {
@@ -265,7 +328,14 @@ async function settleJoin(join: RecordedJoin, deps: MonitorDeps): Promise<void> 
     throw error;
   }
 
-  await deps.repository.setChannelJoinOutcome(job.updateId, "banned");
+  if (banned) {
+    await deps.repository.markChannelJoinBanned(job.updateId);
+    return;
+  }
+
+  // The stored profile stays. The join keeps its outcome in the batch, so only
+  // a join without a profile lookup queues one.
+  await deps.repository.setChannelJoinOutcome(job.updateId, "allowed");
 }
 
 async function lookUpProfile(
@@ -289,6 +359,7 @@ async function lookUpProfile(
 
 async function alertBurst(
   chatJoins: readonly RecordedJoin[],
+  policy: ChannelBanPolicy,
   deps: MonitorDeps,
   retries: Retries,
 ): Promise<void> {
@@ -312,8 +383,14 @@ async function alertBurst(
 
   const window = burstWindow(burstAt);
   const joins = await deps.repository.listChannelJoins(String(chatId), window);
+  const text = buildBurstAlert(
+    chatTitle ?? String(chatId),
+    burstAt,
+    joins,
+    policy.pausedChatIds.has(String(chatId)),
+  );
   try {
-    await sendBurstAlert(chatTitle ?? String(chatId), burstAt, joins, deps);
+    await sendBurstAlert(text, deps);
   } catch (error) {
     // The joins of the burst window come back and alert again.
     console.error("A channel burst alert failed and goes back to the queue", { chatId, error });
@@ -333,24 +410,19 @@ function burstWindow(date: number): ChannelJoinWindow {
   return { after: date - BURST_WINDOW_SECONDS, until: date };
 }
 
-async function sendBurstAlert(
-  channel: string,
-  burstAt: number,
-  joins: readonly ChannelJoinEntry[],
-  deps: MonitorDeps,
-): Promise<void> {
-  if (!deps.alertUserId) {
+async function sendBurstAlert(text: string, deps: MonitorDeps): Promise<void> {
+  const recipientId = deps.operatorUserId;
+  if (recipientId === null) {
     return;
   }
 
   try {
-    const text = buildBurstAlert(channel, burstAt, joins);
-    await callTelegram(() => deps.api.sendMessage(Number(deps.alertUserId), text));
+    await callTelegram(() => deps.api.sendMessage(recipientId, text));
   } catch (error) {
     // A rejected alert still starts the cooldown. Other errors retry.
     if (isRejection(error)) {
       console.error("Telegram rejected a channel burst alert", {
-        recipientId: deps.alertUserId,
+        recipientId,
         error: error.description,
       });
       return;
@@ -396,6 +468,49 @@ async function processProfiles(
   messages: readonly Message<ChannelProfileJob>[],
   deps: MonitorDeps,
 ): Promise<void> {
+  await processOneByOne(messages, "A subscriber profile lookup", deps.profileLookupPauseMs, async (job) => {
+    const profile = await lookUpProfile(job.userId, deps);
+    if (profile) {
+      await deps.repository.saveChannelJoinProfile(job.updateId, profile);
+    }
+  });
+}
+
+async function processUnbans(
+  messages: readonly Message<ChannelUnbanJob>[],
+  deps: MonitorDeps,
+): Promise<void> {
+  await processOneByOne(messages, "A channel subscriber unban", 0, async (job) => {
+    try {
+      await callTelegram(() =>
+        deps.api.unbanChatMember(job.chatId, job.userId, { only_if_banned: true }),
+      );
+    } catch (error) {
+      // A rejected unban leaves the join banned. Other errors retry the unban.
+      if (isRejection(error)) {
+        console.error("Telegram rejected a channel subscriber unban", {
+          chatId: job.chatId,
+          userId: job.userId,
+          error: error.description,
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    await deps.repository.markChannelSubscriberUnbanned(String(job.chatId), String(job.userId));
+  });
+}
+
+// Handles the messages one by one and pauses between them. A failed message
+// goes back to the queue.
+async function processOneByOne<Job>(
+  messages: readonly Message<Job>[],
+  action: string,
+  pauseMs: number,
+  handle: (job: Job) => Promise<void>,
+): Promise<void> {
   let rateLimit: QueueRetryOptions | null = null;
   for (const [index, message] of messages.entries()) {
     // Only a rate limit above the wait limit gets here. Further Telegram calls
@@ -405,21 +520,15 @@ async function processProfiles(
       continue;
     }
 
-    if (index > 0 && deps.profileLookupPauseMs > 0) {
-      await sleep(deps.profileLookupPauseMs);
+    if (index > 0 && pauseMs > 0) {
+      await sleep(pauseMs);
     }
 
     try {
-      const profile = await lookUpProfile(message.body.userId, deps);
-      if (profile) {
-        await deps.repository.saveChannelJoinProfile(message.body.updateId, profile);
-      }
+      await handle(message.body);
       message.ack();
     } catch (error) {
-      console.error("A subscriber profile lookup failed and goes back to the queue", {
-        updateId: message.body.updateId,
-        error,
-      });
+      console.error(`${action} failed and goes back to the queue`, { job: message.body, error });
       message.retry(retryOptions(error));
       rateLimit = isRateLimit(error) ? (retryOptions(error) ?? {}) : null;
     }
@@ -468,37 +577,18 @@ function buildBurstAlert(
   channel: string,
   burstAt: number,
   joins: readonly ChannelJoinEntry[],
+  bansPaused: boolean,
 ): string {
   const header = [
     "ОЙОЙ АЛЕРТ",
-    `Канал «${channel}», ${MOSCOW_TIME.format(new Date(burstAt * 1000))} МСК.`,
+    `Канал «${channel}», ${formatMoscowTime(new Date(burstAt * 1000))} МСК.`,
     `DDoS: ${BURST_LIMIT} или больше вступлений за ${BURST_WINDOW_SECONDS} секунды.`,
     "В списке — подписчики, которых бот записал к моменту алерта.",
-    "Бот банит только профили ботов. ⛔ — забанен, ⚠️ — бан не прошёл, ⏳ — проверяется.",
+    bansPaused
+      ? "Автобаны на паузе, бот никого не банит. /resume включит их."
+      : "Бот банит только профили ботов. ⛔ — забанен, ⚠️ — бан не прошёл, ⏳ — проверяется.",
     "",
   ];
-  const lines = joins.map(
-    (join) =>
-      `${OUTCOME_MARKS[join.outcome]} ${join.displayName}` +
-      `${join.username ? ` @${join.username}` : ""} · ${join.userId}`,
-  );
+  const lines = joins.map((join) => `${OUTCOME_MARKS[join.outcome]} ${formatSubscriber(join)}`);
   return fitMessage(header, lines);
-}
-
-// Keeps the lines that fit into one message and counts the rest.
-function fitMessage(header: string[], lines: string[]): string {
-  const text = [...header, ...lines].join("\n");
-  if (text.length <= TELEGRAM_MESSAGE_LIMIT) {
-    return text;
-  }
-
-  const overflowRoom = `\n… и ещё ${lines.length}.`.length;
-  let length = header.join("\n").length;
-  let shown = 0;
-  while (length + 1 + lines[shown]!.length + overflowRoom <= TELEGRAM_MESSAGE_LIMIT) {
-    length += 1 + lines[shown]!.length;
-    shown += 1;
-  }
-
-  return [...header, ...lines.slice(0, shown), `… и ещё ${lines.length - shown}.`].join("\n");
 }
