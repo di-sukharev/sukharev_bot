@@ -1,6 +1,11 @@
 import { Bot, Context, GrammyError } from "grammy";
-import type { Chat, Message, Update, User, UserFromGetMe } from "grammy/types";
-import { enqueueChannelJoin } from "./channel-join-monitor";
+import type { Chat, ChatMemberUpdated, Message, Update, User, UserFromGetMe } from "grammy/types";
+import {
+  enqueueChannelJoin,
+  isBannedOnJoin,
+  isChatParticipant,
+  isInChat,
+} from "./channel-join-monitor";
 import { createChannelOperatorCommands } from "./channel-operator";
 import { createD1CommunityBotRepository } from "./repository";
 import type {
@@ -224,17 +229,20 @@ export function createCommunityBot(
 
   bot.on("chat_member", async (ctx) => {
     const chatMemberUpdate = ctx.update.chat_member;
-    const newMember = chatMemberUpdate.new_chat_member;
-    const oldMember = chatMemberUpdate.old_chat_member;
-    const user = newMember.user;
+    const user = chatMemberUpdate.new_chat_member.user;
 
-    if (user.is_bot || !isJoinTransition(oldMember.status, newMember.status, newMember)) {
+    if (user.is_bot || !isJoinTransition(chatMemberUpdate)) {
       return;
     }
 
+    // The join monitor protects community chats as well as monitored channels.
+    await enqueueChannelJoin(env.CHANNEL_JOIN_QUEUE, ctx.update.update_id, chatMemberUpdate);
     const profile = telegramUserToProfile(user);
     await ctx.repository.upsertUser(profile);
-    if (isWelcomeMuted(ctx.config)) {
+    if (
+      isWelcomeMuted(ctx.config) ||
+      (await isBannedOnJoin(env.DB, ctx.config.ownerUserIds, chatMemberUpdate))
+    ) {
       return;
     }
 
@@ -721,10 +729,8 @@ async function maybeBanForLowVibe(
   const score = knownScore ?? await ctx.repository.getVibeScore(chatId, recipient.id);
   if (score <= LOW_VIBE_BAN_THRESHOLD) {
     const member = await ctx.api.getChatMember(apiChatId, Number(recipient.id));
-    const isParticipant = member.status === "member" ||
-      (member.status === "restricted" && member.is_member);
     if (
-      !isParticipant ||
+      !isChatParticipant(member) ||
       normalizeTelegramUsername(member.user.username) === "haltmachina"
     ) {
       return;
@@ -1377,23 +1383,6 @@ function isChatIdCommand(update: Update, botUsername: string | null): boolean {
   return normalized === "/chatid" || normalized === `/chatid@${botUsername ?? ""}`;
 }
 
-type ChatMemberStatusCarrier = {
-  status: string;
-  is_member?: boolean;
-  user: User;
-};
-
-function isJoinTransition(
-  oldStatus: string,
-  newStatus: string,
-  newMember: ChatMemberStatusCarrier,
-): boolean {
-  const wasOut = oldStatus === "left" || oldStatus === "kicked";
-  const isIn =
-    newStatus === "member" ||
-    newStatus === "administrator" ||
-    newStatus === "creator" ||
-    (newStatus === "restricted" && newMember.is_member === true);
-
-  return wasOut && isIn;
+function isJoinTransition(update: ChatMemberUpdated): boolean {
+  return !isInChat(update.old_chat_member) && isInChat(update.new_chat_member);
 }

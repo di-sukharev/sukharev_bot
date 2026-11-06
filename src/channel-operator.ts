@@ -23,7 +23,7 @@ const RECENT_JOIN_LIMIT = 20;
 const CHECKED_JOIN_LIMIT = 5;
 
 const OPERATOR_COMMANDS: BotCommand[] = [
-  { command: "stats", description: "Сводка по каналу за 24 часа" },
+  { command: "stats", description: "Сводка за 24 часа" },
   { command: "recent", description: "Последние 20 вступлений" },
   { command: "check", description: "Что бот знает о подписчике: /check ID или @ник" },
   { command: "unban", description: "Разбанить и больше не банить: /unban ID или @ник" },
@@ -55,7 +55,9 @@ const RULE_LABELS: Record<SubscriberRule, string> = {
 
 type OperatorDeps = {
   repository: ChannelJoinRepository;
-  channelIds: number[];
+  // Monitored channels and community chats.
+  chatIds: number[];
+  monitoredChannelIds: Set<string>;
   ownerUserIds: Set<string>;
   joinQueue: Queue<ChannelJoinQueueJob> | undefined;
 };
@@ -76,7 +78,9 @@ export function createChannelOperatorCommands(
 
   const deps: OperatorDeps = {
     repository: createD1ChannelJoinRepository(env.DB),
-    channelIds: [...config.monitoredChannelIds].map(Number),
+    // A monitored channel can also be an allowed chat.
+    chatIds: [...new Set([...config.monitoredChannelIds, ...config.allowedChatIds])].map(Number),
+    monitoredChannelIds: config.monitoredChannelIds,
     ownerUserIds: config.ownerUserIds,
     joinQueue: env.CHANNEL_JOIN_QUEUE,
   };
@@ -92,13 +96,13 @@ export function createChannelOperatorCommands(
   });
 
   operator.command("stats", async (ctx) => {
-    for (const chatId of deps.channelIds) {
+    for (const chatId of deps.chatIds) {
       await ctx.reply(await statsText(chatId, ctx.msg.date, deps));
     }
   });
 
   operator.command("recent", async (ctx) => {
-    for (const chatId of deps.channelIds) {
+    for (const chatId of deps.chatIds) {
       await ctx.reply(await recentText(chatId, deps));
     }
   });
@@ -118,21 +122,26 @@ export function createChannelOperatorCommands(
   });
 
   operator.command("pause", async (ctx) => {
-    await deps.repository.pauseChannelBans(deps.channelIds.map(String));
+    await deps.repository.pauseChannelBans(deps.chatIds.map(String));
     await ctx.reply("Автобаны на паузе. Алерты продолжат приходить. /resume включит баны.");
   });
 
   operator.command("resume", async (ctx) => {
-    await deps.repository.resumeChannelBans(deps.channelIds.map(String));
+    await deps.repository.resumeChannelBans(deps.chatIds.map(String));
     await ctx.reply("Автобаны снова работают.");
   });
 
   return composer;
 }
 
+// Names a chat by its kind, for example "канал -100123".
+function chatName(chatId: number | string, deps: OperatorDeps): string {
+  return `${deps.monitoredChannelIds.has(String(chatId)) ? "канал" : "чат"} ${chatId}`;
+}
+
 function helpText(): string {
   return [
-    "Команды для каналов. Они работают только здесь, в личке с ботом.",
+    "Команды антифрода для каналов и чатов. Они работают только здесь, в личке с ботом.",
     "",
     ...OPERATOR_COMMANDS.map(({ command, description }) => `/${command} — ${description}`),
   ].join("\n");
@@ -146,7 +155,7 @@ async function statsText(chatId: number, now: number, deps: OperatorDeps): Promi
   const total = OUTCOMES.reduce((sum, outcome) => sum + stats.outcomes[outcome], 0);
 
   return [
-    `Канал ${chatId}, последние 24 часа.`,
+    `За 24 часа, ${chatName(chatId, deps)}.`,
     `Вступили: ${total}`,
     ...OUTCOMES.map(
       (outcome) => `${OUTCOME_MARKS[outcome]} ${OUTCOME_LABELS[outcome]}: ${stats.outcomes[outcome]}`,
@@ -168,11 +177,11 @@ async function statsText(chatId: number, now: number, deps: OperatorDeps): Promi
 async function recentText(chatId: number, deps: OperatorDeps): Promise<string> {
   const joins = await deps.repository.listRecentChannelJoins(String(chatId), RECENT_JOIN_LIMIT);
   if (joins.length === 0) {
-    return `Канал ${chatId}: вступлений пока нет.`;
+    return `Вступлений пока нет, ${chatName(chatId, deps)}.`;
   }
 
   return fitMessage(
-    [`Канал ${chatId}, последние вступления по московскому времени.`, OUTCOME_LEGEND, ""],
+    [`Последние вступления, ${chatName(chatId, deps)}. Время московское.`, OUTCOME_LEGEND, ""],
     joins.map(
       (join) =>
         `${OUTCOME_MARKS[join.outcome]} ${formatMoscowTime(new Date(join.joinedAt * 1000))} ` +
@@ -222,7 +231,7 @@ async function subscriberText(userId: string, deps: OperatorDeps): Promise<strin
 
   const [latest] = joins;
   if (!user || !latest) {
-    lines.push("Бот не видел, как он вступал в каналы.");
+    lines.push("Бот не видел, как он вступал в каналы и чаты.");
     return lines.join("\n");
   }
 
@@ -235,7 +244,7 @@ async function subscriberText(userId: string, deps: OperatorDeps): Promise<strin
   for (const join of joins) {
     lines.push(
       `${OUTCOME_MARKS[join.outcome]} ${formatMoscowTime(new Date(join.joinedAt * 1000))}, ` +
-        `канал ${join.chatId}${join.isPremium ? ", Premium" : ""}.`,
+        `${chatName(join.chatId, deps)}${join.isPremium ? ", Premium" : ""}.`,
       describeProfile(join.profile),
     );
   }
@@ -275,14 +284,14 @@ async function unban(userId: string, api: Api, deps: OperatorDeps): Promise<stri
   await deps.repository.exemptFromChannelBans(userId);
 
   const rejections: string[] = [];
-  for (const chatId of deps.channelIds) {
+  for (const chatId of deps.chatIds) {
     try {
       await api.unbanChatMember(chatId, Number(userId), { only_if_banned: true });
     } catch (error) {
       if (!(error instanceof GrammyError)) {
         throw error;
       }
-      rejections.push(`канал ${chatId}: ${error.description}`);
+      rejections.push(`- ${chatName(chatId, deps)}: ${error.description}`);
       continue;
     }
     await deps.repository.markChannelSubscriberUnbanned(String(chatId), userId);
@@ -307,7 +316,7 @@ async function unbanRecentBans(argument: string, deps: OperatorDeps): Promise<st
   // Ban times use the Worker clock.
   const after = Math.floor(Date.now() / 1000) - hours * 60 * 60;
   let queued = 0;
-  for (const chatId of deps.channelIds) {
+  for (const chatId of deps.chatIds) {
     const userIds = await deps.repository.listBannedChannelSubscribers(String(chatId), after);
     await enqueueChannelUnbans(deps.joinQueue, chatId, userIds.map(Number));
     queued += userIds.length;

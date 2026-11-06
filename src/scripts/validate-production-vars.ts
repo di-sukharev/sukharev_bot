@@ -18,6 +18,10 @@ const config = Bun.TOML.parse(readFileSync("wrangler.toml", "utf8")) as Wrangler
 const botInfo = readBotInfo(config);
 const welcomeMutedUntil = readOptionalStringVar(config, "WELCOME_MUTED_UNTIL");
 const monitoredChannelIds = readOptionalStringVar(config, "MONITORED_CHANNEL_IDS")?.trim();
+// The join monitor protects monitored channels and community chats.
+const joinMonitorEnabled = Boolean(
+  monitoredChannelIds || readOptionalStringVar(config, "ALLOWED_CHAT_IDS")?.trim(),
+);
 const channelOperatorUserId = readOptionalStringVar(config, "CHANNEL_OPERATOR_USER_ID");
 
 if (
@@ -48,18 +52,18 @@ if (
   );
 }
 
-if (monitoredChannelIds && !/^\d+$/u.test(channelOperatorUserId?.trim() ?? "")) {
+if (joinMonitorEnabled && !/^\d+$/u.test(channelOperatorUserId?.trim() ?? "")) {
   throw new Error(
-    "wrangler.toml CHANNEL_OPERATOR_USER_ID must be a Telegram user ID when MONITORED_CHANNEL_IDS is set",
+    "wrangler.toml CHANNEL_OPERATOR_USER_ID must be a Telegram user ID when MONITORED_CHANNEL_IDS or ALLOWED_CHAT_IDS is set",
   );
 }
 
-if (monitoredChannelIds) {
+if (joinMonitorEnabled) {
   for (const binding of ["CHANNEL_JOIN_QUEUE", "CHANNEL_PROFILE_QUEUE"]) {
     const queue = config.queues?.producers?.find((producer) => producer.binding === binding)?.queue;
     if (!queue || !config.queues?.consumers?.some((consumer) => consumer.queue === queue)) {
       throw new Error(
-        `wrangler.toml must bind ${binding} to a queue with a consumer when MONITORED_CHANNEL_IDS is set`,
+        `wrangler.toml must bind ${binding} to a queue with a consumer when MONITORED_CHANNEL_IDS or ALLOWED_CHAT_IDS is set`,
       );
     }
   }

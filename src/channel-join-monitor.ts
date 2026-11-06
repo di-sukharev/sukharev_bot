@@ -1,5 +1,5 @@
 import { Api, GrammyError } from "grammy";
-import type { ChatMemberUpdated, User } from "grammy/types";
+import type { ChatMember, ChatMemberUpdated, User } from "grammy/types";
 import {
   classifySubscriber,
   isFarmProfile,
@@ -89,13 +89,14 @@ type RecordedJoin = {
 // The retry options of each message that the queue must deliver again.
 type Retries = Map<Message<ChannelJoinJob>, QueueRetryOptions | undefined>;
 
-// Runs in the webhook. The queue keeps the work off the shared webhook.
+// Runs in the webhook for monitored channels and community chats. The queue
+// keeps the work off the shared webhook.
 export async function enqueueChannelJoin(
   queue: Queue<ChannelJoinQueueJob> | undefined,
   updateId: number,
   update: ChatMemberUpdated,
 ): Promise<void> {
-  if (!isSubscription(update)) {
+  if (!isNewMember(update)) {
     return;
   }
 
@@ -161,12 +162,39 @@ function hasJobType<Type extends ChannelJob["type"]>(type: Type) {
     message.body.type === type;
 }
 
-function isSubscription(update: ChatMemberUpdated): boolean {
-  const oldStatus = update.old_chat_member.status;
-  return (
-    (oldStatus === "left" || oldStatus === "kicked") &&
-    update.new_chat_member.status === "member"
+// Runs in the webhook of a community chat. The chat skips the welcome of a new
+// member that the rules ban without a profile check.
+export async function isBannedOnJoin(
+  database: D1Database,
+  ownerUserIds: Set<string>,
+  update: ChatMemberUpdated,
+): Promise<boolean> {
+  const user = joinedUser(update);
+  if (!isNewMember(update) || classifySubscriber(user) !== "ban") {
+    return false;
+  }
+
+  const policy = await createD1ChannelJoinRepository(database).getChannelBanPolicy(
+    [String(update.chat.id)],
+    [String(user.id)],
   );
+  return !isSpared(update.chat.id, user.id, policy, ownerUserIds);
+}
+
+// An ordinary member of the chat. A restricted user keeps the status after
+// leaving the chat, with is_member false.
+export function isChatParticipant(member: ChatMember): boolean {
+  return member.status === "member" || (member.status === "restricted" && member.is_member);
+}
+
+// A participant, an administrator, or the creator.
+export function isInChat(member: ChatMember): boolean {
+  return isChatParticipant(member) || member.status === "administrator" || member.status === "creator";
+}
+
+// Administrators and the creator are never new members.
+function isNewMember(update: ChatMemberUpdated): boolean {
+  return !isInChat(update.old_chat_member) && isChatParticipant(update.new_chat_member);
 }
 
 // On a self-join the performer is the subscriber, and it can carry more fields.
@@ -191,7 +219,7 @@ async function processJoins(
     [...new Set(jobs.map((job) => String(job.user.id)))],
   );
   const outcomes = await deps.repository.recordChannelJoins(
-    jobs.map((job) => joinInput(job, isSpared(job, policy, deps))),
+    jobs.map((job) => joinInput(job, isSpared(job.chatId, job.user.id, policy, deps.ownerUserIds))),
   );
   const joins = messages.map((message, index): RecordedJoin => ({
     message,
@@ -263,13 +291,17 @@ function joinInput(job: ChannelJoinJob, spared: boolean): ChannelJoinInput {
 }
 
 // The bot bans no owner, no user that the operator exempted, and nobody in a
-// channel where the operator paused bans.
-function isSpared(job: ChannelJoinJob, policy: ChannelBanPolicy, deps: MonitorDeps): boolean {
-  const userId = String(job.user.id);
+// chat where the operator paused bans.
+function isSpared(
+  chatId: number,
+  userId: number,
+  policy: ChannelBanPolicy,
+  ownerUserIds: Set<string>,
+): boolean {
   return (
-    deps.ownerUserIds.has(userId) ||
-    policy.exemptUserIds.has(userId) ||
-    policy.pausedChatIds.has(String(job.chatId))
+    ownerUserIds.has(String(userId)) ||
+    policy.exemptUserIds.has(String(userId)) ||
+    policy.pausedChatIds.has(String(chatId))
   );
 }
 
@@ -279,7 +311,7 @@ async function isSparedNow(job: ChannelJoinJob, deps: MonitorDeps): Promise<bool
     [String(job.chatId)],
     [String(job.user.id)],
   );
-  return isSpared(job, policy, deps);
+  return isSpared(job.chatId, job.user.id, policy, deps.ownerUserIds);
 }
 
 // A due ban stays ban_failed until Telegram confirms it.
@@ -574,14 +606,14 @@ function retryOptions(error: unknown): QueueRetryOptions | undefined {
 }
 
 function buildBurstAlert(
-  channel: string,
+  chat: string,
   burstAt: number,
   joins: readonly ChannelJoinEntry[],
   bansPaused: boolean,
 ): string {
   const header = [
     "ОЙОЙ АЛЕРТ",
-    `Канал «${channel}», ${formatMoscowTime(new Date(burstAt * 1000))} МСК.`,
+    `«${chat}», ${formatMoscowTime(new Date(burstAt * 1000))} МСК.`,
     `DDoS: ${BURST_LIMIT} или больше вступлений за ${BURST_WINDOW_SECONDS} секунды.`,
     "В списке — подписчики, которых бот записал к моменту алерта.",
     bansPaused

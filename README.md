@@ -18,9 +18,10 @@ The project is distributed under the [Apache License 2.0](LICENSE).
 - permanently bans users at −10 vibe or below and requests deletion of all their
   messages in the same chat via Telegram's `revoke_messages` option;
 - provides `/chatid`, `/rules`, `/vibe`, and `/vibe_top` commands;
-- records new subscribers of monitored channels, bans subscriber farm profiles,
-  alerts the channel operator about a join burst, and gives the operator
-  private commands for stats, checks, unbans, and pauses;
+- records new subscribers of monitored channels and new members of community
+  chats, bans farm profiles, alerts the channel operator about a join burst,
+  and gives the operator private commands for stats, checks, unbans, and
+  pauses;
 - processes community updates idempotently through D1 reservations.
 
 The bot is intentionally project-specific. Moderation thresholds, Russian copy,
@@ -105,7 +106,9 @@ production:
 
 Runtime variables belong in `wrangler.toml`:
 
-- `ALLOWED_CHAT_IDS` — comma-separated chat IDs;
+- `ALLOWED_CHAT_IDS` — comma-separated community chat IDs. The join monitor
+  also protects these chats, so the production preflight requires the channel
+  queues and `CHANNEL_OPERATOR_USER_ID` when the list is set;
 - `OWNER_USER_IDS` — protected Telegram user IDs;
 - `BOT_INFO` — Telegram `getMe` result object encoded as JSON;
 - `ANNOUNCE_REACTIONS` — whether reaction vibe changes are announced;
@@ -117,7 +120,8 @@ Runtime variables belong in `wrangler.toml`:
   `CHANNEL_JOIN_QUEUE` and `CHANNEL_PROFILE_QUEUE` bindings with consumers;
 - `CHANNEL_OPERATOR_USER_ID` — Telegram user ID of the channel operator. The
   operator receives join burst alerts and runs the channel commands. The
-  production preflight requires it when `MONITORED_CHANNEL_IDS` is set.
+  production preflight requires it when `MONITORED_CHANNEL_IDS` or
+  `ALLOWED_CHAT_IDS` is set.
 
 Webhook setup additionally reads:
 
@@ -181,16 +185,22 @@ mutate the webhook from a dirty Git tree.
 
 ## Channel join monitor
 
-The bot protects each channel in `MONITORED_CHANNEL_IDS` against subscriber
-farms. Add the bot to the channel as an administrator with
-`can_restrict_members`. Telegram sends `chat_member` updates only after the bot
-becomes an administrator, so the monitor cannot see earlier subscribers.
+The bot protects each channel in `MONITORED_CHANNEL_IDS` and each community
+chat in `ALLOWED_CHAT_IDS` against subscriber farms. Add the bot to each of them
+as an administrator with the right to ban users (`can_restrict_members`).
+Telegram sends `chat_member` updates only after the bot becomes an
+administrator, so the monitor cannot see earlier members. The tables and types
+keep the `channel_` prefix for both kinds of chats.
 
 The webhook only puts each new subscription into `CHANNEL_JOIN_QUEUE`, so a
 join flood does not hold up the community chat on the shared single-connection
-webhook. The join queue consumer stores the joins, bans, checks profiles, and
-alerts. It handles one batch at a time and makes Telegram calls one by one, so
-bans stay within the Telegram rate limit. On a rate limit of up to 60 seconds,
+webhook. A new member of a community chat, also a restricted one, goes into the
+same queue, and the other community features stay as they are. The chat skips
+the welcome of a member that the rules ban at once. A member that waits for a
+profile check gets the welcome, which the bot deletes after 15 seconds anyway.
+The join queue consumer stores the joins, bans, checks profiles, and alerts. It
+handles one batch at a time and makes Telegram calls one by one, so bans stay
+within the Telegram rate limit. On a rate limit of up to 60 seconds,
 both channel consumers wait for the `retry_after` time of Telegram, repeat the
 call, and continue the batch. The wait uses no delivery attempt. On a longer
 rate limit, the affected message and the rest of the batch go back to the queue
@@ -219,7 +229,7 @@ count as 3 farm digits. The rules live in
 [`src/channel-join-rules.ts`](src/channel-join-rules.ts).
 
 The bot never bans `OWNER_USER_IDS`, users that the operator exempted, or anyone
-in a channel where the operator paused bans. These joins are stored as
+in a chat where the operator paused bans. These joins are stored as
 `allowed`. A pause or an exemption also stops a ban that is still pending.
 
 Every subscription is stored in `channel_joins` with its Premium flag, language
@@ -233,7 +243,7 @@ later rule tuning. Profile lookups pause between calls and leave the Telegram
 rate limit to bans. A rejected lookup leaves the flags `NULL`.
 
 A burst is 50 or more joins within 2 seconds. A burst bans nobody. It sends a
-private alert to the operator at most once per 5 minutes per channel.
+private alert to the operator at most once per 5 minutes per chat.
 The alert lists the subscribers of those 2 seconds that the bot recorded by the
 moment of the alert, with the bot's action for each. When the list exceeds one
 Telegram message, the alert shows its start and the number of other
@@ -252,7 +262,8 @@ and continues from its stored outcome. A retried alert can arrive twice.
 
 The operator runs these commands in the private chat with the bot. The bot
 ignores them from other users and in other chats. Each command applies to all
-monitored channels.
+monitored channels and community chats. The replies name a monitored channel
+`канал` and a community chat `чат`.
 
 - `/start` adds the commands to the operator's command menu and lists them.
 - `/stats` counts the joins of the last 24 hours by outcome and shows the last
@@ -338,6 +349,9 @@ The previous Worker keeps working against `0011`, but it ignores pauses and
 exemptions and drops queued `channel_unban` jobs. Roll back with
 `wrangler rollback`, which keeps the previous version's `CHANNEL_ALERT_USER_ID`,
 instead of a redeploy of the previous commit.
+
+Community chat protection needs no migration. Before deploying it, check that
+the bot is an administrator of each community chat with the right to ban users.
 
 ## License
 
